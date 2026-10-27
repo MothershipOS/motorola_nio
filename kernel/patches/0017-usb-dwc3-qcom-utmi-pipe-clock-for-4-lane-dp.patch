@@ -1,0 +1,194 @@
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -51,6 +51,23 @@
+ 
+ #include "phy-qcom-qmp-usb43-pcs-v8.h"
+ 
++#include <linux/phy/phy-qcom-qmp-combo.h>
++
++/* mothershipOS: USB3 half gone / back (DP-only pin assignments), for the USB controller's glue */
++static BLOCKING_NOTIFIER_HEAD(qmp_combo_usb3_notifier);
++
++int qcom_qmp_combo_usb3_notifier_register(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&qmp_combo_usb3_notifier, nb);
++}
++EXPORT_SYMBOL_GPL(qcom_qmp_combo_usb3_notifier_register);
++
++int qcom_qmp_combo_usb3_notifier_unregister(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(&qmp_combo_usb3_notifier, nb);
++}
++EXPORT_SYMBOL_GPL(qcom_qmp_combo_usb3_notifier_unregister);
++
+ /* QPHY_V3_DP_COM_RESET_OVRD_CTRL register bits */
+ /* DP PHY soft reset */
+ #define SW_DPPHY_RESET				BIT(0)
+@@ -4439,6 +4456,12 @@
+ 	dev_dbg(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
+ 		qmp->qmpphy_mode, new_mode);
+ 
++	/* mothershipOS: the USB glue switches its PIPE clock; it only queues work (we hold phy_mutex) */
++	if ((new_mode == QMPPHY_MODE_DP_ONLY) != (qmp->qmpphy_mode == QMPPHY_MODE_DP_ONLY))
++		blocking_notifier_call_chain(&qmp_combo_usb3_notifier,
++					     new_mode == QMPPHY_MODE_DP_ONLY ? QMP_COMBO_USB3_GONE :
++					     QMP_COMBO_USB3_BACK, qmp->dev);
++
+ 	qmp->qmpphy_mode = new_mode;
+ 
+ 	if (qmp->init_count) {
+--- a/drivers/usb/dwc3/dwc3-qcom-legacy.c
++++ b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+@@ -17,6 +17,8 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/phy/phy.h>
++#include <linux/phy/phy-qcom-qmp-combo.h>
++#include <linux/workqueue.h>
+ #include <linux/usb/of.h>
+ #include <linux/reset.h>
+ #include <linux/iopoll.h>
+@@ -90,6 +92,12 @@
+ 	bool			pm_suspended;
+ 	struct icc_path		*icc_path_ddr;
+ 	struct icc_path		*icc_path_apps;
++
++	/* mothershipOS: the QMP combo PHY's USB3 half comes and goes with the DP pin assignment */
++	struct device_node	*usb3_phy_np;
++	struct notifier_block	usb3_nb;
++	struct work_struct	usb3_work;
++	bool			usb3_gone;
+ };
+ 
+ static inline void dwc3_qcom_setbits(void __iomem *base, u32 offset, u32 val)
+@@ -531,6 +539,80 @@
+ 			  PIPE_UTMI_CLK_DIS);
+ }
+ 
++/* mothershipOS: back to the QMP PHY's PIPE clock (reverse of dwc3_qcom_select_utmi_clk) */
++static void dwc3_qcom_select_pipe_clk(struct dwc3_qcom *qcom)
++{
++	dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
++			  PIPE_UTMI_CLK_DIS);
++
++	usleep_range(100, 1000);
++
++	dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
++			  PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++
++	usleep_range(100, 1000);
++
++	dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
++			  PIPE_UTMI_CLK_DIS);
++}
++
++/*
++ * mothershipOS: with a DP-only pin assignment (4-lane DisplayPort over Type-C) the QMP combo PHY powers its USB3
++ * half off, and with it the PIPE clock the controller runs from: even USB 2.0 devices (a monitor's hub) no
++ * longer enumerate. Run the PIPE side from the UTMI clock while USB3 is gone, back from the PHY afterwards, and
++ * restart the controller's current role so it comes up on the new clock (as Qualcomm's downstream dwc3-msm).
++ */
++static void dwc3_qcom_usb3_work(struct work_struct *work)
++{
++	struct dwc3_qcom *qcom = container_of(work, struct dwc3_qcom, usb3_work);
++	struct dwc3 *dwc = platform_get_drvdata(qcom->dwc3);
++	u32 role;
++
++	if (qcom->usb3_gone)
++		dwc3_qcom_select_utmi_clk(qcom);
++	else
++		dwc3_qcom_select_pipe_clk(qcom);
++
++	if (!dwc || dwc->dr_mode != USB_DR_MODE_OTG)
++		return;
++	role = dwc->desired_dr_role ? dwc->desired_dr_role : dwc->current_dr_role;
++	if (role != DWC3_GCTL_PRTCAP_HOST && role != DWC3_GCTL_PRTCAP_DEVICE)
++		return;
++	dwc3_set_mode(dwc, role == DWC3_GCTL_PRTCAP_HOST ? DWC3_GCTL_PRTCAP_DEVICE : DWC3_GCTL_PRTCAP_HOST);
++	flush_work(&dwc->drd_work);
++	dwc3_set_mode(dwc, role);
++	flush_work(&dwc->drd_work);
++	dev_info(qcom->dev, "USB3 PHY %s: PIPE clock from %s, %s restarted\n",
++		 qcom->usb3_gone ? "gone (DP only)" : "back", qcom->usb3_gone ? "UTMI" : "the PHY",
++		 role == DWC3_GCTL_PRTCAP_HOST ? "host" : "device");
++}
++
++static int dwc3_qcom_usb3_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	struct dwc3_qcom *qcom = container_of(nb, struct dwc3_qcom, usb3_nb);
++	struct device *phy_dev = data;
++
++	if (!phy_dev || phy_dev->of_node != qcom->usb3_phy_np)
++		return NOTIFY_DONE;
++	qcom->usb3_gone = action == QMP_COMBO_USB3_GONE;
++	schedule_work(&qcom->usb3_work);	/* the PHY calls us with its mutex held */
++	return NOTIFY_OK;
++}
++
++static void dwc3_qcom_usb3_follow_phy(struct dwc3_qcom *qcom)
++{
++	struct device_node *dwc3_np = qcom->dwc3->dev.of_node;
++	struct of_phandle_args args;
++	int idx = of_property_match_string(dwc3_np, "phy-names", "usb3-phy");
++
++	if (idx < 0 || of_parse_phandle_with_args(dwc3_np, "phys", "#phy-cells", idx, &args))
++		return;
++	qcom->usb3_phy_np = args.np;
++	INIT_WORK(&qcom->usb3_work, dwc3_qcom_usb3_work);
++	qcom->usb3_nb.notifier_call = dwc3_qcom_usb3_notify;
++	qcom_qmp_combo_usb3_notifier_register(&qcom->usb3_nb);
++}
++
+ static int dwc3_qcom_request_irq(struct dwc3_qcom *qcom, int irq,
+ 				 const char *name)
+ {
+@@ -823,6 +905,9 @@
+ 	pm_runtime_enable(dev);
+ 	pm_runtime_forbid(dev);
+ 
++	if (!ignore_pipe_clk)
++		dwc3_qcom_usb3_follow_phy(qcom);
++
+ 	return 0;
+ 
+ interconnect_exit:
+@@ -847,6 +932,12 @@
+ 	struct device *dev = &pdev->dev;
+ 	int i;
+ 
++	if (qcom->usb3_phy_np) {
++		qcom_qmp_combo_usb3_notifier_unregister(&qcom->usb3_nb);
++		cancel_work_sync(&qcom->usb3_work);
++		of_node_put(qcom->usb3_phy_np);
++	}
++
+ 	of_platform_depopulate(&pdev->dev);
+ 	platform_device_put(qcom->dwc3);
+ 
+--- a/include/linux/phy/phy-qcom-qmp-combo.h
++++ b/include/linux/phy/phy-qcom-qmp-combo.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * mothershipOS: the QMP USB3/DP combo PHY tells the USB controller's glue when its USB3 half goes away (Type-C DP
++ * pin assignment C/E: all four lanes are DisplayPort) and when it comes back. A Qualcomm dwc3 then has to run
++ * its PIPE side from the UTMI clock, or even USB 2.0 stops working.
++ */
++#ifndef __PHY_QCOM_QMP_COMBO_H
++#define __PHY_QCOM_QMP_COMBO_H
++
++#include <linux/notifier.h>
++
++/* notifier actions; the data pointer is the PHY's struct device */
++#define QMP_COMBO_USB3_GONE	1
++#define QMP_COMBO_USB3_BACK	2
++
++#if IS_ENABLED(CONFIG_PHY_QCOM_QMP_COMBO)
++int qcom_qmp_combo_usb3_notifier_register(struct notifier_block *nb);
++int qcom_qmp_combo_usb3_notifier_unregister(struct notifier_block *nb);
++#else
++static inline int qcom_qmp_combo_usb3_notifier_register(struct notifier_block *nb) { return 0; }
++static inline int qcom_qmp_combo_usb3_notifier_unregister(struct notifier_block *nb) { return 0; }
++#endif
++
++#endif

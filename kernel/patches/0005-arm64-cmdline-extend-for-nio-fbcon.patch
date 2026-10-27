@@ -1,0 +1,19 @@
+mothershipOS: re-add CMDLINE_EXTEND on arm64 so the kernel appends console=tty0 + fbcon font
+to nio's U-Boot env bootargs (baked into hyp_b). Generic support lives in drivers/of/fdt.c.
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -2436,6 +2436,13 @@
+ 	  This is useful if you cannot or don't want to change the
+ 	  command-line options your boot loader passes to the kernel.
+ 
++config CMDLINE_EXTEND
++	bool "Extend bootloader kernel arguments"
++	help
++	  The default kernel command string is appended to the command-line
++	  arguments provided by the boot loader (handled in drivers/of/fdt.c).
++	  mothershipOS: nio's U-Boot env bootargs are baked into hyp_b.
++
+ endchoice
+ 
+ config EFI_STUB

@@ -1,0 +1,66 @@
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -2435,6 +2435,49 @@
+ module_param_cb(download_mode, &download_mode_param_ops, NULL, 0644);
+ MODULE_PARM_DESC(download_mode, "download mode: off/0/N for no dump mode, full/on/1/Y for full dump mode, mini for minidump mode and full,mini for both full and minidump mode together are acceptable values");
+ 
++/* nio bring-up: fixed, read-only queries; never exposes arbitrary SCM calls. */
++static ssize_t nio_secure_state_show(struct device *dev,
++                                    struct device_attribute *attr, char *buf)
++{
++	const struct qcom_scm_desc desc = {
++		.svc = QCOM_SCM_SVC_INFO,
++		.cmd = 0x04, /* TZ_INFO_GET_SECURE_STATE */
++		.arginfo = QCOM_SCM_ARGS(0),
++		.owner = ARM_SMCCC_OWNER_SIP,
++	};
++	struct qcom_scm_res res = {};
++	int ret;
++
++	ret = qcom_scm_call(dev, &desc, &res);
++	return sysfs_emit(buf, "status=%d r1=0x%llx r2=0x%llx r3=0x%llx\n",
++			  ret, (unsigned long long)res.result[0],
++			  (unsigned long long)res.result[1],
++			  (unsigned long long)res.result[2]);
++}
++static DEVICE_ATTR(nio_secure_state, 0400, nio_secure_state_show, NULL);
++
++static ssize_t nio_soc_hw_version_show(struct device *dev,
++                                      struct device_attribute *attr, char *buf)
++{
++	unsigned int value = 0;
++	int ret;
++
++	ret = qcom_scm_io_readl(0x01fc8000, &value);
++	return sysfs_emit(buf, "status=%d address=0x01fc8000 value=0x%08x\n",
++			  ret, value);
++}
++static DEVICE_ATTR(nio_soc_hw_version, 0400, nio_soc_hw_version_show, NULL);
++
++static struct attribute *nio_scm_attrs[] = {
++	&dev_attr_nio_secure_state.attr,
++	&dev_attr_nio_soc_hw_version.attr,
++	NULL,
++};
++
++static const struct attribute_group nio_scm_group = {
++	.attrs = nio_scm_attrs,
++};
++
+ static int qcom_scm_probe(struct platform_device *pdev)
+ {
+ 	struct qcom_tzmem_pool_config pool_config;
+@@ -2572,6 +2615,13 @@
+ 	/* Initialize the QTEE object interface. */
+ 	qcom_scm_qtee_init(scm);
+ 
++	if (of_machine_is_compatible("motorola,nio") ||
++	    of_machine_is_compatible("qcom,kona-nio")) {
++		ret = devm_device_add_group(scm->dev, &nio_scm_group);
++		if (ret)
++			dev_warn(scm->dev, "nio diagnostic attributes unavailable: %d\n", ret);
++	}
++
+ 	return 0;
+ 
+ err_rmem:

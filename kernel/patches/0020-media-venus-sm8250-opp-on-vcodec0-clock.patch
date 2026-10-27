@@ -1,0 +1,37 @@
+From: mothershipOS
+Subject: [PATCH] media: venus: key the SM8250 OPP table to the vcodec0 core clock
+
+The SM8250 Venus OPP table lists MVS0 rates (video_cc_mvs0_clk = the source / 3: 240/338/366/444 MHz), but the
+driver registers "core" (MVS0C, the source / 2) as the OPP clock. dev_pm_opp_set_rate() rounds the target on that
+clock: 444 MHz became 507 MHz, which has no OPP, so every level above the lowest failed ("failed to find OPP for
+freq 507000000", then "HW can't support this load") and the core stayed at 240 MHz whatever the load. Use
+"vcodec0_core" as the OPP clock on SM8250, so the rate, its rounding and the required performance states match.
+
+---
+--- a/drivers/media/platform/qcom/venus/pm_helpers.c
++++ b/drivers/media/platform/qcom/venus/pm_helpers.c
+@@ -8,6 +8,7 @@
+ #include <linux/interconnect.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
++#include <linux/of.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_runtime.h>
+@@ -990,7 +991,15 @@
+ 	if (legacy_binding)
+ 		return 0;
+ 
+-	ret = devm_pm_opp_set_clkname(dev, "core");
++	/*
++	 * SM8250: the OPP table lists the vcodec0 core clock rates (MVS0, the
++	 * source / 3: 240/338/366/444 MHz). "core" is MVS0C (the source / 2), so
++	 * every level above the lowest rounded to a rate with no OPP and the
++	 * clock could never scale up. Key the OPPs to vcodec0_core there.
++	 */
++	ret = devm_pm_opp_set_clkname(dev,
++				      of_device_is_compatible(dev->of_node, "qcom,sm8250-venus") ?
++				      "vcodec0_core" : "core");
+ 	if (ret)
+ 		return ret;
+ 

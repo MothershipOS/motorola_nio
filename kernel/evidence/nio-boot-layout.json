@@ -1,0 +1,66 @@
+{
+  "scope": "Current slot A boot layout; bootloader temporary-boot support unverified",
+  "boot_header_version": 3,
+  "vendor_boot_header_version": 3,
+  "vendor_page_size": 4096,
+  "vendor_dtb_bytes": 710237,
+  "vendor_dtb_blobs": [
+    {
+      "index": 0,
+      "offset": 0,
+      "bytes": 56270,
+      "sha256": "8db1efca6256e4acdf72f6951978ed85a3b7b266268bf1b67705e45f9ed2737b"
+    },
+    {
+      "index": 1,
+      "offset": 56270,
+      "bytes": 45766,
+      "sha256": "3e85370bc835d6f04aa974c3a038600cc828d206497d159f8b2dc6e001228182"
+    },
+    {
+      "index": 2,
+      "offset": 102036,
+      "bytes": 10197,
+      "sha256": "32c2bb3363cfac91e5b29c6eae9b5bca2b5b74a475a74b0eb72a2a53761cc935"
+    },
+    {
+      "index": 3,
+      "offset": 112233,
+      "bytes": 46803,
+      "sha256": "1ce5d204e2b9e88fbf275db991d92996f1591d8642cfdaf9d6f8984bb9e5414f"
+    },
+    {
+      "index": 4,
+      "offset": 159036,
+      "bytes": 14097,
+      "sha256": "eab9bafcec46e49b0e4ab2c4372d2ce90650f468857be5c1ad20a26b115b0627"
+    },
+    {
+      "index": 5,
+      "offset": 173133,
+      "bytes": 4753,
+      "sha256": "aef4a1c033c98c54dfc3dbe54d18c13babe7573eb6aa04862ee7af1070832151"
+    },
+    {
+      "index": 6,
+      "offset": 177886,
+      "bytes": 35979,
+      "sha256": "3063ddc72b8be876c9ef845620930b624e74b0cd5f9290ef2e2b1fe054a32734"
+    },
+    {
+      "index": 7,
+      "offset": 213865,
+      "bytes": 25541,
+      "sha256": "680e279df7d8d4051164888a2e2d5c3fa05402d0792335da53f714ee526fc23f"
+    },
+    {
+      "index": 8,
+      "offset": 239406,
+      "bytes": 470831,
+      "sha256": "eea020cc2879550e0e07da6578806bb5e66ee2378389859006df8510b07d2422"
+    }
+  ],
+  "observed_dtb_idx": 8,
+  "observed_dtbo_idx": 0,
+  "dtbo_entry_count": 1
+}

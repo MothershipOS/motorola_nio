@@ -1,0 +1,50 @@
+# motorola_nio: sources and docs only. Device dumps, proprietary firmware, kernel trees and images stay local.
+
+# device reports, partition/firmware backups (may contain identifiers)
+reports/
+backups/
+unbrick/images/
+# kernel source + build outputs, bring-up scratch
+kernel-work/
+build/
+u-boot-src/
+*.deb
+*.tar.gz
+*.cpio.gz
+# boot images and binaries
+*.itb
+*.dtb
+*.img
+*.mbn
+*.bin
+*.elf
+*.o
+*.so
+Image-*
+# proprietary firmware blobs (READMEs and manifests are tracked)
+firmware/**/*
+!firmware/**/
+!firmware/**/README.md
+!firmware/**/SHA256SUMS
+!firmware/**/SENSORS.txt
+# tool state, caches, logs
+__pycache__/
+*.pyc
+.shots/
+.known_hosts
+live.log
+*.log
+# third-party trees vendored for bring-up
+archive/kvmtool-bringup/src/
+archive/kvmtool-bringup/guest-initrd/
+# CAD exports
+*.stl
+*.step
+*.FCStd
+# prebuilt binaries inside source dirs
+**/host-initrd/bin/
+**/host-initrd/lib/
+**/host-initrd/usr/
+**/touchinject/touchinject
+# the phone's own Bluetooth address (cargo xtask fit puts it in the DT)
+boot/bd-address

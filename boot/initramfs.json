@@ -1,0 +1,19 @@
+{
+  "comment": "The host initramfs (cargo xtask fit): /init is mship-init (built static), busybox serves the RAM host's shells, the firmware the kernel needs before the root is mounted. Local files are the phone's own firmware (motorola_nio/firmware, not in git).",
+  "busybox": {
+    "url": "http://ports.ubuntu.com/ubuntu-ports/pool/main/b/busybox/busybox-static_1.37.0-7ubuntu1_arm64.deb",
+    "sha256": "fcf50794faf920455895d7ef103d1c54b9ebf7f18d2e52982dbf3903b7769592"
+  },
+  "firmware": [
+    { "path": "lib/firmware/qcom/a650_sqe.fw", "url": "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/bf992df7a95b5e19bb8f8546eb4d7c53ab2598d0/qcom/a650_sqe.fw", "sha256": "c863ceac3a823af215205d7803776bfdc68098c2c2a5d2fd05b4aa77cd336b4b" },
+    { "path": "lib/firmware/qcom/sm8250/a650_zap.mbn", "url": "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/bf992df7a95b5e19bb8f8546eb4d7c53ab2598d0/qcom/sm8250/a650_zap.mbn", "sha256": "0624d84e0ecc5e08dce55e33c4e0e34a4c1221bb8b9b2716c699a2cb79fe99de" },
+    { "path": "lib/firmware/qcom/a650_gmu.bin", "local": "motorola_nio/firmware/nio-modem-image/a650_gmu.bin", "sha256": "df79fa8482fcc7587bb239b9c9e2b24bce4729893b990fe3f82b30da8175b01c" },
+    { "path": "lib/firmware/qcom/sm8250/nio/a650_zap.mdt", "local": "motorola_nio/firmware/nio-modem-image/a650_zap.mdt", "sha256": "c9a11d4a02a7589c8307c959345f26c8658ee7f2cc559f82517ae07da164ce2c" },
+    { "path": "lib/firmware/qcom/sm8250/nio/a650_zap.b00", "local": "motorola_nio/firmware/nio-modem-image/a650_zap.b00", "sha256": "ec9b9d5a67456384809624b14a00d15d36297e5f2e75728504cd872bc95e0947" },
+    { "path": "lib/firmware/qcom/sm8250/nio/a650_zap.b01", "local": "motorola_nio/firmware/nio-modem-image/a650_zap.b01", "sha256": "fb1265e0440d58c45d7c12e32ece6a151f3c4c5c53b985abc9d6d70a2152ba3c" },
+    { "path": "lib/firmware/qcom/sm8250/nio/a650_zap.b02", "local": "motorola_nio/firmware/nio-modem-image/a650_zap.b02", "sha256": "a415e5452fa8f597670a6e51010e97bfabca7d20fbce8044caed64d9d5873113" },
+    { "path": "lib/firmware/qcom/sm8250/nio/qupv3fw.elf", "local": "motorola_nio/firmware/nio-qup/qupv3fw.elf", "sha256": "f4fe4c66038ca8b6c8b4668071b2e7cf0155e3b84bc66ccd87c2d6335b37a297" },
+    { "path": "lib/firmware/novatek/nt36672c-tianma-nio.bin", "local": "motorola_nio/firmware/nio-touch/novatek_ts_fw.bin", "sha256": "9d51674752bf3f3c5e28ed03eb3dca7f5fbd46da9a89e578ab18ccc427fd9614" },
+    { "path": "lib/firmware/qcom/sm8250/nio/venus-vpu.mbn", "local": "motorola_nio/firmware/nio-venus/venus.mbn", "sha256": "a66e86e34dc69a870fe631c73ed4a93d9fcfea6f3f2a4ac02cb118cb505bbbb2" }
+  ]
+}

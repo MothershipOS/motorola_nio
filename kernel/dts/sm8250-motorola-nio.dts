@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Motorola nio initial bring-up, based on the connected XT2125-4's live DT.
+ * Development definition. Enabled so far: USB 2.0 peripheral (diagnostics),
+ * the bootloader splash buffer as a simple framebuffer, and reboot-mode.
+ * Storage, display pipeline and remote processors remain disabled.
+ */
+/dts-v1/;
+
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include "sm8250.dtsi"
+#include "pm8150.dtsi"
+#include "pm8150b.dtsi"
+#include "pm8150l.dtsi"
+
+/ {
+	/*
+	 * Motorola ABL only accepts a base (SoC) DTB whose model contains
+	 * "Qualcomm Technologies, Inc."; otherwise it logs "No match found for
+	 * Soc Dtb type" and refuses to boot.
+	 */
+	model = "Qualcomm Technologies, Inc. SM8250 Motorola nio (development)";
+	compatible = "motorola,nio", "qcom,sm8250";
+	chassis-type = "handset";
+
+	/*
+	 * ABL selects the base DTB with these IDs; they match the stock base
+	 * DTB (vendor_boot index 8). The live tree reports board-id <0 0xa000>
+	 * only because the dtbo overlay replaces it after selection.
+	 */
+	qcom,msm-id = <356 0x20001>;
+	qcom,board-id = <0 0>;
+
+	aliases {
+		/* Vendor serial0 points at disabled UART2; UART12 is enabled. */
+		serial0 = &uart12;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+
+		/*
+		 * Motorola ABL prepends /chosen/bootargs to the kernel command line
+		 * and asserts in AsciiStrCatS (SafeString.c:786) when it is absent.
+		 * Keep bootloader-configured clocks/power domains for the splash
+		 * framebuffer until the display pipeline is described.
+		 */
+		bootargs = "clk_ignore_unused pd_ignore_unused";
+
+		/* Continuous-splash buffer left scanning out by ABL (video-mode panel). */
+		framebuffer: framebuffer@9c000000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0 0x9c000000 0x0 0x2300000>;
+			width = <1080>;
+			height = <2520>;
+			stride = <(1080 * 4)>;
+			format = "a8r8g8b8";
+		};
+	};
+
+	/* RAM bank sizes must be supplied by the bootloader, as in sm8250.dtsi. */
+	reserved-memory {
+		/* Retain every fixed reservation observed on this phone. */
+		xbl_uefi_log_mem: memory@80880000 {
+			reg = <0 0x80880000 0 0x14000>;
+			no-map;
+		};
+
+		cont_splash_mem: memory@9c000000 {
+			reg = <0 0x9c000000 0 0x2300000>;
+			no-map;
+		};
+
+		dfps_mem: memory@9e300000 {
+			reg = <0 0x9e300000 0 0x100000>;
+			no-map;
+		};
+
+		wdog_cpuctx_mem: memory@aef9b800 {
+			reg = <0 0xaef9b800 0 0x34000>;
+			no-map;
+		};
+
+		mmi_annotate_mem: memory@aefcf800 {
+			reg = <0 0xaefcf800 0 0x800>;
+			no-map;
+		};
+
+		tzlog_mem: memory@aefd0000 {
+			reg = <0 0xaefd0000 0 0x30000>;
+			no-map;
+		};
+
+		/* Reserve only: enable ramoops after deciding a compatible layout. */
+		ramoops_mem: memory@af000000 {
+			reg = <0 0xaf000000 0 0xc0000>;
+			no-map;
+		};
+	};
+
+	vph_pwr: vph-pwr-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vph_pwr";
+		regulator-min-microvolt = <3700000>;
+		regulator-max-microvolt = <3700000>;
+	};
+};
+
+&apps_rsc {
+	regulators-0 {
+		compatible = "qcom,pm8150-rpmh-regulators";
+		qcom,pmic-id = "a";
+
+		vdd-s1-supply = <&vph_pwr>;
+		vdd-s2-supply = <&vph_pwr>;
+		vdd-s3-supply = <&vph_pwr>;
+		vdd-s4-supply = <&vph_pwr>;
+		vdd-s5-supply = <&vph_pwr>;
+		vdd-s6-supply = <&vph_pwr>;
+		vdd-s7-supply = <&vph_pwr>;
+		vdd-s8-supply = <&vph_pwr>;
+		vdd-s9-supply = <&vph_pwr>;
+		vdd-s10-supply = <&vph_pwr>;
+
+		/* USB HS PHY rails; voltages match the live phy@88e3000 supplies. */
+		vreg_l2a_3p1: ldo2 {
+			regulator-name = "vreg_l2a_3p1";
+			regulator-min-microvolt = <3072000>;
+			regulator-max-microvolt = <3072000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l5a_0p88: ldo5 {
+			regulator-name = "vreg_l5a_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <880000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l12a_1p8: ldo12 {
+			regulator-name = "vreg_l12a_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+&pon {
+	/* PMIC PON spare reason, as written by the downstream msm-poweroff driver. */
+	mode-bootloader = <0x2>;
+	mode-recovery = <0x1>;
+};
+
+&soc {
+	/* Motorola ABL also reads the IMEM restart reason (downstream offset 0x65c). */
+	imem@146bf000 {
+		compatible = "syscon", "simple-mfd";
+		reg = <0x0 0x146bf000 0x0 0x1000>;
+
+		reboot-mode {
+			compatible = "syscon-reboot-mode";
+			offset = <0x65c>;
+			mode-normal = <0x77665501>;
+			mode-bootloader = <0x77665500>;
+			mode-recovery = <0x77665502>;
+		};
+	};
+};
+
+&qupv3_id_1 {
+	status = "okay";
+};
+
+&uart12 {
+	status = "okay";
+};
+
+&tlmm {
+	/* Owned by secure firmware in the downstream nio definition. */
+	gpio-reserved-ranges = <28 4>, <40 4>;
+};
+
+&usb_1 {
+	/* USB 2.0 only until the Type-C redriver and QMP combo PHY are described. */
+	qcom,select-utmi-as-pipe-clk;
+	status = "okay";
+};
+
+&usb_1_dwc3 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
+};
+
+&usb_1_hsphy {
+	vdda-pll-supply = <&vreg_l5a_0p88>;
+	vdda18-supply = <&vreg_l12a_1p8>;
+	vdda33-supply = <&vreg_l2a_3p1>;
+	status = "okay";
+};
+
+&venus {
+	/* Hardware video decode at EL2 without QHEE: non-secure (no-TZ) bring-up. A video-firmware subnode makes the
+	 * venus driver load the firmware itself and skip TZ's secure-SID step (unreachable from our EL2; see
+	 * ports/nio/docs/video.md). firmware-name: upstream non-secure iris2 blob (linux-firmware qcom/vpu-1.0),
+	 * installed as venus-vpu.mbn. The firmware's own SMMU streams are {0x2102, 0x2502} (measured), covered by
+	 * SID 0x2102 mask 0x400 -- NOT the sc7180/sc7280 base+0x42 = 0x2142 convention, which faults here. */
+	firmware-name = "qcom/sm8250/nio/venus-vpu.mbn";
+	status = "okay";
+
+	video-firmware {
+		iommus = <&apps_smmu 0x2102 0x400>;
+	};
+};

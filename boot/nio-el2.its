@@ -1,0 +1,29 @@
+/dts-v1/;
+/ {
+    description = "nio EL2 Linux (6.18 + initramfs)";
+    #address-cells = <1>;
+    images {
+        kernel {
+            description = "Linux 6.18";
+            data = /incbin/("./Image");
+            type = "kernel"; arch = "arm64"; os = "linux"; compression = "none";
+            load = <0xa0000000>; entry = <0xa0000000>;
+        };
+        fdt {
+            description = "nio DTB (UFS enabled, real memory)";
+            data = /incbin/("./nio.dtb");
+            type = "flat_dt"; arch = "arm64"; compression = "none";
+            load = <0xa4000000>;
+        };
+        ramdisk {
+            description = "initramfs busybox";
+            data = /incbin/("./initramfs.cpio.gz");
+            type = "ramdisk"; arch = "arm64"; os = "linux"; compression = "none";
+            load = <0xa4200000>;
+        };
+    };
+    configurations {
+        default = "conf";
+        conf { description = "nio EL2"; kernel = "kernel"; fdt = "fdt"; ramdisk = "ramdisk"; };
+    };
+};

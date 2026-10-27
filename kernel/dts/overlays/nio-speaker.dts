@@ -1,0 +1,85 @@
+/dts-v1/;
+/plugin/;
+/ {
+ fragment@0 {
+  target-path = "/soc@0/geniqup@8c0000/i2c@884000";
+  __overlay__ {
+   #address-cells = <1>;
+   #size-cells = <0>;
+   nio_speaker: speaker@34 {
+    compatible = "mothership,nio-aw882xx";
+    reg = <0x34>;
+    /* Live nio base DT pins TLMM phandle 0x55; active-low reset. */
+    reset-gpios = <0x55 139 1>;
+    #sound-dai-cells = <0>;
+   };
+  };
+ };
+ fragment@1 {
+  target-path = "/soc@0/pinctrl@f100000";
+  __overlay__ {
+   nio_tert_mi2s: nio-tert-mi2s-state {
+    sck { pins = "gpio133"; function = "mi2s2_sck"; drive-strength = <8>; bias-disable; };
+    ws { pins = "gpio135"; function = "mi2s2_ws"; drive-strength = <8>; bias-disable; };
+    sd1 { pins = "gpio137"; function = "mi2s2_data1"; drive-strength = <8>; bias-disable; };
+   };
+  };
+ };
+ fragment@2 {
+  target-path = "/soc@0/remoteproc@17300000/glink-edge/apr/service@4";
+  __overlay__ {
+   dais { status = "disabled"; };
+   nio_q6afe: nio-dais {
+    compatible = "qcom,q6afe-dais";
+    #address-cells = <1>; #size-cells = <0>; #sound-dai-cells = <1>;
+    dai@20 { reg = <20>; qcom,sd-lines = <1>; };
+   };
+  };
+ };
+ fragment@3 {
+  target-path = "/soc@0/remoteproc@17300000/glink-edge/apr/service@7";
+  __overlay__ {
+   dais { status = "disabled"; };
+   nio_q6asm: nio-dais {
+    compatible = "qcom,q6asm-dais";
+    #address-cells = <1>; #size-cells = <0>; #sound-dai-cells = <1>;
+    iommus = <0x31 0x1801 0>;
+    dai@0 { reg = <0>; };	/* MultiMedia1 */
+   };
+  };
+ };
+ fragment@4 {
+  target-path = "/soc@0/remoteproc@17300000/glink-edge/apr/service@8";
+  __overlay__ {
+   routing { status = "disabled"; };
+   nio_q6routing: nio-routing {
+    compatible = "qcom,q6adm-routing";
+    #sound-dai-cells = <0>;
+   };
+  };
+ };
+ fragment@5 {
+  target-path = "/";
+  __overlay__ {
+   nio-sound {
+    compatible = "qcom,sm8250-sndcard";
+    model = "mothership-nio-speaker";
+    pinctrl-names = "default"; pinctrl-0 = <&nio_tert_mi2s>;
+    widgets = "Speaker", "Speaker";
+    audio-routing = "Speaker", "Speaker Output";
+    /* Overlay application reverses child order; the card needs the MultiMedia1 FE (q6asm-dai)
+     * probed before the BE link (q6routing), so the BE link is listed first here. */
+    speaker-link {
+     link-name = "Nio Speaker";
+     cpu { sound-dai = <&nio_q6afe 20>; };
+     platform { sound-dai = <&nio_q6routing>; };
+     codec { sound-dai = <&nio_speaker>; };
+    };
+    mm1-link {
+     link-name = "MultiMedia1";
+     cpu { sound-dai = <&nio_q6asm 0>; };
+    };
+   };
+  };
+ };
+};

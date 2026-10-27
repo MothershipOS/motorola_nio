@@ -1,0 +1,23 @@
+media: qcom: camss: scale camnoc_axi_src on sm8250 (mothershipOS)
+
+vfe_match_clock_names() only matches "camnoc_axi" (single {0} entry), so the sm8250 rate table on
+"camnoc_axi_src" (19.2/300/400/480 MHz) is never used and the camera NoC stays at XO 19.2 MHz.
+The bus write masters starve: CCIF violation on the RDI WM, no buf-done (16 MP@30 always, 1080p@120
+intermittently). With the fix camnoc runs at 300 MHz for RDI RAW10 679.68 Mpix/s.
+
+--- a/drivers/media/platform/qcom/camss/camss-vfe.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe.c
+@@ -914,7 +914,12 @@
+ 	return (!strcmp(clock->name, vfe_name) ||
+ 		!strcmp(clock->name, vfe_lite_name) ||
+ 		!strcmp(clock->name, "vfe_lite") ||
+-		!strcmp(clock->name, "camnoc_axi"));
++		!strcmp(clock->name, "camnoc_axi") ||
++		/*
++		 * sm8250 lists its camnoc rate table on the _src clock; without scaling it the
++		 * camera NoC stays at XO (19.2 MHz), starving the bus write masters (CCIF violations).
++		 */
++		!strcmp(clock->name, "camnoc_axi_src"));
+ }
+ 
+ /*

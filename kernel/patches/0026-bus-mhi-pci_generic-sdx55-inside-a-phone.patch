@@ -1,0 +1,413 @@
+From: mothershipOS
+Subject: [PATCH] bus: mhi: host: pci_generic: SDX55 inside a phone (fusion)
+
+The SDX55 of an SM8250 phone has no flash: the host pushes sbl1 over BHI and serves the rest of its boot chain over
+Sahara (mhi_sahara). Its subsystem ID (17cb:010c) is that of a Foxconn card; a "qcom,ext-sdx55m" compatible on
+the modem's PCI device node selects a profile with sbl1, the stock firmware's channel map (Sahara, boot log, EFS,
+DIAG, QMI, IPCR, DUN, IP_HW0), the control and bandwidth rings on MSI vector 0 with polling, the MSI doorbell
+mapped into the modem's IOMMU domain, answered bandwidth requests and the M3 cycle at mission mode, without runtime suspend (the link does not come back). The SBL boot
+log goes to the kernel log. After the alioth bring-up (github.com/cancelledbit/alioth-modem, GPL-2.0).
+
+---
+--- a/drivers/bus/mhi/host/pci_generic.c
++++ b/drivers/bus/mhi/host/pci_generic.c
+@@ -10,8 +10,10 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/iommu.h>
+ #include <linux/mhi.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pci.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/timer.h>
+@@ -39,6 +41,8 @@
+  * @fw: firmware path (if any)
+  * @edl: emergency download mode firmware path (if any)
+  * @edl_trigger: capable of triggering EDL mode in the device (if supported)
++ * @sbl_bounce: flashless modem (an SDX55 inside a phone): its SBL restarts the link and its event rings
++ *	raise no MSI; the host feeds it every image (sbl1 over BHI, the rest over Sahara)
+  * @bar_num: PCI base address register to use for MHI MMIO register space
+  * @dma_data_width: DMA transfer word size (32 or 64 bits)
+  * @vf_dma_data_width: DMA transfer word size for VF's (optional)
+@@ -55,6 +59,7 @@
+ 	const char *fw;
+ 	const char *edl;
+ 	bool edl_trigger;
++	bool sbl_bounce;
+ 	unsigned int bar_num;
+ 	unsigned int dma_data_width;
+ 	unsigned int vf_dma_data_width;
+@@ -167,6 +172,22 @@
+ 		.doorbell_mode_switch = false,		\
+ 	}
+ 
++#define MHI_CHANNEL_CONFIG_DL_SBL_AUTOQUEUE(ch_num, ch_name, el_count, ev_ring) \
++	{						\
++		.num = ch_num,				\
++		.name = ch_name,			\
++		.num_elements = el_count,		\
++		.event_ring = ev_ring,			\
++		.dir = DMA_FROM_DEVICE,			\
++		.ee_mask = BIT(MHI_EE_SBL),		\
++		.pollcfg = 0,				\
++		.doorbell = MHI_DB_BRST_DISABLE,	\
++		.lpm_notify = false,			\
++		.offload_channel = false,		\
++		.doorbell_mode_switch = false,		\
++		.auto_queue = true,			\
++	}
++
+ #define MHI_CHANNEL_CONFIG_UL_FP(ch_num, ch_name, el_count, ev_ring) \
+ 	{						\
+ 		.num = ch_num,				\
+@@ -395,6 +416,87 @@
+ 	.sideband_wake = false,
+ };
+ 
++/*
++ * An SDX55 inside a phone ("fusion", SM8250 + X55: Motorola nio, Xiaomi alioth): no flash of its own. The host
++ * pushes sbl1 over BHI; the SBL then asks for the rest of the boot chain over Sahara (channels 2/3, mhi_sahara),
++ * logs on channel 25, and the running modem takes its NV (EFS) over channels 10/11. The device tree selects
++ * this (compatible "qcom,ext-sdx55m" on the modem's PCI node): the subsystem ID is that of a Foxconn card.
++ * Channel map as in the stock firmware's; the SBL and the AMSS raise no MSI for the higher vectors, so the
++ * control and bandwidth rings share vector 0 and the rings are polled (see the flashless support in the MHI
++ * core). Derived from the alioth bring-up (github.com/cancelledbit/alioth-modem, GPL-2.0).
++ */
++static bool fusion_poll = true;
++module_param(fusion_poll, bool, 0444);
++MODULE_PARM_DESC(fusion_poll, "Poll the event rings of a flashless modem (its MSIs for event rings do not arrive)");
++
++static const struct mhi_channel_config mhi_qcom_sdx55_fusion_channels[] = {
++	/* as the stock firmware's (128): an answer is one chained transfer of up to 8 MB (64 KB packets) */
++	MHI_CHANNEL_CONFIG_UL_SBL(2, "SAHARA", 128, 0),
++	MHI_CHANNEL_CONFIG_DL_SBL(3, "SAHARA", 128, 0),
++	MHI_CHANNEL_CONFIG_DL_SBL_AUTOQUEUE(25, "BL", 32, 0),
++	MHI_CHANNEL_CONFIG_UL(10, "EFS", 32, 0),
++	MHI_CHANNEL_CONFIG_DL(11, "EFS", 32, 0),
++	MHI_CHANNEL_CONFIG_UL(4, "DIAG", 32, 0),
++	MHI_CHANNEL_CONFIG_DL(5, "DIAG", 32, 0),
++	MHI_CHANNEL_CONFIG_UL(14, "QMI", 32, 0),
++	MHI_CHANNEL_CONFIG_DL(15, "QMI", 32, 0),
++	MHI_CHANNEL_CONFIG_UL(20, "IPCR", 32, 0),
++	MHI_CHANNEL_CONFIG_DL(21, "IPCR", 32, 0),
++	MHI_CHANNEL_CONFIG_UL(32, "DUN", 32, 0),
++	MHI_CHANNEL_CONFIG_DL(33, "DUN", 32, 0),
++	MHI_CHANNEL_CONFIG_HW_UL(100, "IP_HW0", 128, 2),
++	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 128, 3),
++};
++
++static struct mhi_event_config mhi_qcom_sdx55_fusion_events[] = {
++	{
++		.num_elements = 256,
++		.irq_moderation_ms = 0,
++		.irq = 0,
++		.priority = 1,
++		.mode = MHI_DB_BRST_DISABLE,
++		.data_type = MHI_ER_CTRL,
++		.hardware_event = false,
++		.client_managed = false,
++		.offload_channel = false,
++	},
++	{
++		/* the AMSS asks for a link change moments after it starts and resets if nobody answers */
++		.num_elements = 32,
++		.irq_moderation_ms = 0,
++		.irq = 0,
++		.priority = 1,
++		.mode = MHI_DB_BRST_DISABLE,
++		.data_type = MHI_ER_BW_SCALE,
++		.hardware_event = false,
++		.client_managed = false,
++		.offload_channel = false,
++	},
++	MHI_EVENT_CONFIG_HW_DATA(2, 1024, 100),
++	MHI_EVENT_CONFIG_HW_DATA(3, 2048, 101),
++};
++
++static const struct mhi_controller_config mhi_qcom_sdx55_fusion_config = {
++	.max_channels = 128,
++	/* sbl1, then ~90 MB over Sahara (~15 s) before mission mode */
++	.timeout_ms = 60000,
++	.num_channels = ARRAY_SIZE(mhi_qcom_sdx55_fusion_channels),
++	.ch_cfg = mhi_qcom_sdx55_fusion_channels,
++	.num_events = ARRAY_SIZE(mhi_qcom_sdx55_fusion_events),
++	.event_cfg = mhi_qcom_sdx55_fusion_events,
++};
++
++static const struct mhi_pci_dev_info mhi_qcom_sdx55_fusion_info = {
++	.name = "qcom-sdx55m-fusion",
++	.fw = "qcom/sdx55m/sbl1.mbn",
++	.sbl_bounce = true,
++	.config = &mhi_qcom_sdx55_fusion_config,
++	.bar_num = MHI_PCI_DEFAULT_BAR_NUM,
++	.dma_data_width = 32,
++	.mru_default = 32768,
++	.sideband_wake = false,
++};
++
+ static const struct mhi_pci_dev_info mhi_qcom_sdx55_info = {
+ 	.name = "qcom-sdx55m",
+ 	.fw = "qcom/sdx55m/sbl1.mbn",
+@@ -1031,8 +1133,62 @@
+ 	struct timer_list health_check_timer;
+ 	unsigned long status;
+ 	bool reset_on_remove;
++	/* flashless modem: the mission mode suspend cycle, the MSI doorbell mapping */
++	bool sbl_bounce;
++	bool force_suspend;
++	struct work_struct mission_mode_work;
++	struct iommu_domain *msi_domain;
++	unsigned long msi_iova;
+ };
+ 
++static void mhi_pci_mission_mode_work(struct work_struct *work);
++
++/*
++ * The modem raises an MSI by writing to the address in its MSI capability, which the DesignWare host gives as a
++ * physical address; the modem sits behind the SMMU, so the write is translated as an IOVA and faults. Map the
++ * doorbell page onto itself in the modem's IOMMU domain.
++ */
++static void mhi_pci_msi_unmap(void *data)
++{
++	struct mhi_pci_device *mhi_pdev = data;
++
++	if (mhi_pdev->msi_domain)
++		iommu_unmap(mhi_pdev->msi_domain, mhi_pdev->msi_iova, PAGE_SIZE);
++	mhi_pdev->msi_domain = NULL;
++}
++
++static void mhi_pci_msi_map(struct mhi_pci_device *mhi_pdev, struct pci_dev *pdev)
++{
++	struct iommu_domain *domain;
++	u32 addr_lo = 0, addr_hi = 0;
++	u16 ctrl;
++
++	if (!pdev->msi_enabled || !pdev->msi_cap)
++		return;
++	pci_read_config_word(pdev, pdev->msi_cap + PCI_MSI_FLAGS, &ctrl);
++	pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_ADDRESS_LO, &addr_lo);
++	if (ctrl & PCI_MSI_FLAGS_64BIT)
++		pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_ADDRESS_HI, &addr_hi);
++	domain = iommu_get_domain_for_dev(&pdev->dev);
++	if (addr_hi || !addr_lo || !domain)
++		return;
++	if (iommu_map(domain, addr_lo & PAGE_MASK, addr_lo & PAGE_MASK, PAGE_SIZE,
++		      IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL))
++		return;
++	mhi_pdev->msi_domain = domain;
++	mhi_pdev->msi_iova = addr_lo & PAGE_MASK;
++	dev_info(&pdev->dev, "MSI doorbell %#x mapped for the modem\n", addr_lo);
++}
++
++/*
++ * The modem's bandwidth requests: the answer is what matters (unanswered, it resets); the link is not retuned
++ * (downstream: msm_pcie_set_link_bandwidth).
++ */
++static int mhi_pci_bw_scale(struct mhi_controller *mhi_cntrl, struct mhi_link_info *link_info)
++{
++	return 0;
++}
++
+ static int mhi_pci_read_reg(struct mhi_controller *mhi_cntrl,
+ 			    void __iomem *addr, u32 *out)
+ {
+@@ -1058,9 +1214,20 @@
+ 		dev_warn(&pdev->dev, "firmware crashed (%u)\n", cb);
+ 		pm_runtime_forbid(&pdev->dev);
+ 		break;
+-	case MHI_CB_EE_MISSION_MODE:
++	case MHI_CB_EE_MISSION_MODE: {
++		struct mhi_pci_device *mhi_pdev = dev_get_drvdata(&pdev->dev);
++
++		/*
++		 * A flashless modem: the PHY switch cycle (not from the state worker: it waits on transitions the
++		 * worker drives), and no runtime suspend: its link does not come back from a D3 lasting longer.
++		 */
++		if (mhi_pdev->sbl_bounce) {
++			queue_work(system_unbound_wq, &mhi_pdev->mission_mode_work);
++			break;
++		}
+ 		pm_runtime_allow(&pdev->dev);
+ 		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -1304,6 +1471,9 @@
+ 	unsigned int dma_data_width;
+ 	int err;
+ 
++	if (of_device_is_compatible(pdev->dev.of_node, "qcom,ext-sdx55m"))
++		info = &mhi_qcom_sdx55_fusion_info;
++
+ 	dev_info(&pdev->dev, "MHI PCI device found: %s\n", info->name);
+ 
+ 	/* mhi_pdev.mhi_cntrl must be zero-initialized */
+@@ -1312,6 +1482,8 @@
+ 		return -ENOMEM;
+ 
+ 	INIT_WORK(&mhi_pdev->recovery_work, mhi_pci_recovery_work);
++	INIT_WORK(&mhi_pdev->mission_mode_work, mhi_pci_mission_mode_work);
++	mhi_pdev->sbl_bounce = info->sbl_bounce;
+ 
+ 	if (pdev->is_virtfn && info->vf_config)
+ 		mhi_cntrl_config = info->vf_config;
+@@ -1347,6 +1519,12 @@
+ 	if (info->edl_trigger)
+ 		mhi_cntrl->edl_trigger = mhi_pci_generic_edl_trigger;
+ 
++	if (info->sbl_bounce) {
++		mhi_cntrl->bw_scale = mhi_pci_bw_scale;
++		mhi_cntrl->wait_for_sbl = true;
++		mhi_cntrl->poll_events = fusion_poll;
++	}
++
+ 	if (info->sideband_wake) {
+ 		mhi_cntrl->wake_get = mhi_pci_wake_get_nop;
+ 		mhi_cntrl->wake_put = mhi_pci_wake_put_nop;
+@@ -1361,6 +1539,14 @@
+ 	if (err)
+ 		return err;
+ 
++	/* after the vectors: the doorbell address is in the capability then; before power-up: the SBL reads it */
++	if (info->sbl_bounce) {
++		mhi_pci_msi_map(mhi_pdev, pdev);
++		err = devm_add_action_or_reset(&pdev->dev, mhi_pci_msi_unmap, mhi_pdev);
++		if (err)
++			return err;
++	}
++
+ 	pci_set_drvdata(pdev, mhi_pdev);
+ 
+ 	/* Have stored pci confspace at hand for restore in sudden PCI error.
+@@ -1421,6 +1607,7 @@
+ 	if (!pdev->is_virtfn)
+ 		timer_delete_sync(&mhi_pdev->health_check_timer);
+ 	cancel_work_sync(&mhi_pdev->recovery_work);
++	cancel_work_sync(&mhi_pdev->mission_mode_work);
+ 
+ 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
+ 		mhi_power_down(mhi_cntrl, true);
+@@ -1572,7 +1759,7 @@
+ 		goto pci_suspend; /* Nothing to do at MHI level */
+ 
+ 	/* Transition to M3 state */
+-	err = mhi_pm_suspend(mhi_cntrl);
++	err = mhi_pdev->force_suspend ? mhi_pm_suspend_force(mhi_cntrl) : mhi_pm_suspend(mhi_cntrl);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "failed to suspend device: %d\n", err);
+ 		clear_bit(MHI_PCI_DEV_SUSPENDED, &mhi_pdev->status);
+@@ -1683,6 +1870,34 @@
+ 	return 0;
+ }
+ 
++/*
++ * A flashless SDX55 at mission mode: one forced M3/D3hot suspend and resume, as downstream does "so the device
++ * can switch to mission mode PCIe PHY settings". Without it the modem answers QMI but keeps its radio off
++ * (DeviceNotReady). Forced: every control channel has buffers queued by then.
++ */
++static void mhi_pci_mission_mode_work(struct work_struct *work)
++{
++	struct mhi_pci_device *mhi_pdev = container_of(work, struct mhi_pci_device, mission_mode_work);
++	struct pci_dev *pdev = to_pci_dev(mhi_pdev->mhi_cntrl.cntrl_dev);
++	int err;
++
++	msleep(200); /* the mission mode transition finishes first */
++	mhi_pdev->force_suspend = true;
++	err = mhi_pci_runtime_suspend(&pdev->dev);
++	mhi_pdev->force_suspend = false;
++	if (err) {
++		dev_warn(&pdev->dev, "mission mode suspend cycle: suspend failed: %d\n", err);
++		return;
++	}
++	pci_save_state(pdev);
++	pci_set_power_state(pdev, PCI_D3hot);
++	msleep(50);
++	pci_set_power_state(pdev, PCI_D0);
++	pci_restore_state(pdev);
++	err = mhi_pci_runtime_resume(&pdev->dev);
++	dev_info(&pdev->dev, "mission mode suspend cycle done (%d)\n", err);
++}
++
+ static const struct dev_pm_ops mhi_pci_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(mhi_pci_runtime_suspend, mhi_pci_runtime_resume, NULL)
+ #ifdef CONFIG_PM_SLEEP
+@@ -1705,7 +1920,75 @@
+ 	.driver.pm	= &mhi_pci_pm_ops,
+ 	.sriov_configure = pci_sriov_configure_simple,
+ };
+-module_pci_driver(mhi_pci_driver);
++/* A flashless modem's SBL boot log (channel BL) into the kernel log */
++static void mhi_pci_bl_dl_cb(struct mhi_device *mhi_dev, struct mhi_result *res)
++{
++	const char *buf = res->buf_addr;
++	size_t len = res->bytes_xferd, pos = 0;
++
++	if (res->transaction_status || !buf)
++		return;
++	while (pos < len) {
++		size_t end = pos;
++
++		while (end < len && buf[end] && buf[end] != '\n' && buf[end] != '\r')
++			end++;
++		if (end > pos)
++			dev_info(&mhi_dev->dev, "%.*s\n", (int)(end - pos), buf + pos);
++		pos = end + 1;
++	}
++}
++
++static void mhi_pci_bl_ul_cb(struct mhi_device *mhi_dev, struct mhi_result *res)
++{
++}
++
++static int mhi_pci_bl_probe(struct mhi_device *mhi_dev, const struct mhi_device_id *id)
++{
++	return mhi_prepare_for_transfer_autoqueue(mhi_dev);
++}
++
++static void mhi_pci_bl_remove(struct mhi_device *mhi_dev)
++{
++	mhi_unprepare_from_transfer(mhi_dev);
++}
++
++static const struct mhi_device_id mhi_pci_bl_match_table[] = {
++	{ .chan = "BL" },
++	{},
++};
++
++static struct mhi_driver mhi_pci_bl_driver = {
++	.id_table = mhi_pci_bl_match_table,
++	.probe = mhi_pci_bl_probe,
++	.remove = mhi_pci_bl_remove,
++	.ul_xfer_cb = mhi_pci_bl_ul_cb,
++	.dl_xfer_cb = mhi_pci_bl_dl_cb,
++	.driver = {
++		.name = "mhi_pci_bl",
++	},
++};
++
++static int __init mhi_pci_init(void)
++{
++	int err;
++
++	err = mhi_driver_register(&mhi_pci_bl_driver);
++	if (err)
++		return err;
++	err = pci_register_driver(&mhi_pci_driver);
++	if (err)
++		mhi_driver_unregister(&mhi_pci_bl_driver);
++	return err;
++}
++module_init(mhi_pci_init);
++
++static void __exit mhi_pci_exit(void)
++{
++	pci_unregister_driver(&mhi_pci_driver);
++	mhi_driver_unregister(&mhi_pci_bl_driver);
++}
++module_exit(mhi_pci_exit);
+ 
+ MODULE_AUTHOR("Loic Poulain <loic.poulain@linaro.org>");
+ MODULE_DESCRIPTION("Modem Host Interface (MHI) PCI controller driver");

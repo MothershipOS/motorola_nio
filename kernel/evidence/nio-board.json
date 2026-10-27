@@ -1,0 +1,248 @@
+{
+  "scope": "Observed XT2125-4 nio on 2026-09-27; hardware facts only, no device identifiers",
+  "live_dtb_sha256": "8dc881b0d03724bd712b448919d07f2c77022a177babbb29dc79f19b5068dd9d",
+  "msm_id": [
+    356,
+    131073
+  ],
+  "board_id": [
+    0,
+    40960
+  ],
+  "abl_base_board_id": [
+    0,
+    0
+  ],
+  "board_id_note": "board_id is the live (post-dtbo-overlay) value; ABL selects the base DTB by abl_base_board_id, as in stock vendor_boot DTB index 8",
+  "enabled_console_address": 11075584,
+  "vendor_serial0_address": 9994240,
+  "vendor_serial0_status": "disabled",
+  "fixed_reserved_memory": [
+    {
+      "vendor_node": "hyp_region@80000000",
+      "cells": [
+        0,
+        2147483648,
+        0,
+        6291456
+      ]
+    },
+    {
+      "vendor_node": "xbl_aop_region@80700000",
+      "cells": [
+        0,
+        2154823680,
+        0,
+        1441792
+      ]
+    },
+    {
+      "vendor_node": "reserved-memory@80860000",
+      "cells": [
+        0,
+        2156265472,
+        0,
+        131072
+      ]
+    },
+    {
+      "vendor_node": "res_xbl_uefi_log_region@80880000",
+      "cells": [
+        0,
+        2156396544,
+        0,
+        81920
+      ]
+    },
+    {
+      "vendor_node": "smem_region@80900000",
+      "cells": [
+        0,
+        2156920832,
+        0,
+        2097152
+      ]
+    },
+    {
+      "vendor_node": "removed_region@80b00000",
+      "cells": [
+        0,
+        2159017984,
+        0,
+        87031808
+      ]
+    },
+    {
+      "vendor_node": "pil_camera_region@86200000",
+      "cells": [
+        0,
+        2250244096,
+        0,
+        5242880
+      ]
+    },
+    {
+      "vendor_node": "pil_wlan_fw_region@86700000",
+      "cells": [
+        0,
+        2255486976,
+        0,
+        1048576
+      ]
+    },
+    {
+      "vendor_node": "pil_ipa_fw_region@86800000",
+      "cells": [
+        0,
+        2256535552,
+        0,
+        65536
+      ]
+    },
+    {
+      "vendor_node": "pil_ipa_gsi_region@86810000",
+      "cells": [
+        0,
+        2256601088,
+        0,
+        40960
+      ]
+    },
+    {
+      "vendor_node": "pil_gpu_region@8681a000",
+      "cells": [
+        0,
+        2256642048,
+        0,
+        8192
+      ]
+    },
+    {
+      "vendor_node": "pil_npu_region@86900000",
+      "cells": [
+        0,
+        2257584128,
+        0,
+        5242880
+      ]
+    },
+    {
+      "vendor_node": "pil_video_region@86e00000",
+      "cells": [
+        0,
+        2262827008,
+        0,
+        5242880
+      ]
+    },
+    {
+      "vendor_node": "pil_cvp_region@87300000",
+      "cells": [
+        0,
+        2268069888,
+        0,
+        5242880
+      ]
+    },
+    {
+      "vendor_node": "pil_cdsp_region@87800000",
+      "cells": [
+        0,
+        2273312768,
+        0,
+        20971520
+      ]
+    },
+    {
+      "vendor_node": "pil_slpi_region@88c00000",
+      "cells": [
+        0,
+        2294284288,
+        0,
+        22020096
+      ]
+    },
+    {
+      "vendor_node": "pil_adsp_region@8a100000",
+      "cells": [
+        0,
+        2316304384,
+        0,
+        30408704
+      ]
+    },
+    {
+      "vendor_node": "pil_spss_region@8be00000",
+      "cells": [
+        0,
+        2346713088,
+        0,
+        1048576
+      ]
+    },
+    {
+      "vendor_node": "cdsp_secure_heap@8bf00000",
+      "cells": [
+        0,
+        2347761664,
+        0,
+        73400320
+      ]
+    },
+    {
+      "vendor_node": "cont_splash_region@9c000000",
+      "cells": [
+        0,
+        2617245696,
+        0,
+        36700160
+      ]
+    },
+    {
+      "vendor_node": "dfps_data_region@9e300000",
+      "cells": [
+        0,
+        2653945856,
+        0,
+        1048576
+      ]
+    },
+    {
+      "vendor_node": "ramoops_mem",
+      "cells": [
+        0,
+        2936012800,
+        0,
+        786432
+      ]
+    },
+    {
+      "vendor_node": "tzlog_dump_mem_region",
+      "cells": [
+        0,
+        2935816192,
+        0,
+        196608
+      ]
+    },
+    {
+      "vendor_node": "mmi_annotate_mem_region",
+      "cells": [
+        0,
+        2935814144,
+        0,
+        2048
+      ]
+    },
+    {
+      "vendor_node": "wdog_cpuctx_region",
+      "cells": [
+        0,
+        2935601152,
+        0,
+        212992
+      ]
+    }
+  ],
+  "dynamic_pool_note": "Vendor size-only pools omitted while their consumers remain disabled; review when enabling each consumer."
+}

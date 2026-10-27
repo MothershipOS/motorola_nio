@@ -1,0 +1,20 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+from pathlib import Path
+folder = Path(__file__).resolve().parent
+doc = App.newDocument('PlateTopViewFillets')
+doc.Label = 'Plate - top-view corner fillets'
+obj = doc.addObject('PartDesign::Feature', 'Plate')
+obj.Label = '79 x 29.5 x 13 mm - R2 corners - 2 x diameter 5'
+obj.Shape = Part.read(str(folder / 'plate_79x29_5x13.step'))
+obj.ViewObject.ShapeColor = (0.3, 0.6, 0.85)
+doc.recompute()
+doc.saveAs(str(folder / 'plate_79x29_5x13.FCStd'))
+Gui.activeDocument().activeView().viewAxonometric()
+Gui.activeDocument().activeView().fitAll()
+window = Gui.getMainWindow()
+window.showMaximized()
+window.raise_()
+window.activateWindow()
+(folder / '.opened-in-freecad').write_text('Loaded corrected model in FreeCAD')

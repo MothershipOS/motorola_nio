@@ -1,0 +1,105 @@
+diff --git a/arch/arm/mach-snapdragon/board.c b/arch/arm/mach-snapdragon/board.c
+index 87adb100..341bf88b 100644
+--- a/arch/arm/mach-snapdragon/board.c
++++ b/arch/arm/mach-snapdragon/board.c
+@@ -13,6 +13,8 @@
+ #include <asm/psci.h>
+ #include <dm/ofnode.h>
+ #include <env.h>
++#include <debug_uart.h>
++#include <cpu_func.h>
+ #include <fdt_support.h>
+ #include <init.h>
+ #include <linux/arm-smccc.h>
+@@ -97,19 +99,13 @@ int board_fdt_blob_setup(void **fdtp)
+ 		panic("Internal FDT is invalid and no external FDT was provided! (fdt=%#llx)\n",
+ 		      (phys_addr_t)external_fdt);
+ 
+-	/* Prefer memory information from internal DT if it's present */
+-	if (internal_valid)
+-		ret = qcom_parse_memory(internal_fdt, true);
+-
+-	if (ret < 0 && external_valid) {
+-		/* No internal FDT or it lacks a proper /memory node.
+-		 * The previous bootloader handed us something, let's try that.
+-		 */
+-		if (internal_valid)
+-			debug("No memory info in internal FDT, falling back to external\n");
+-
++	/* nio: prefer the ABL-provided (external) DTB - it's the real SM8250 nio DT with
++	 * ABL-filled memory; the built-in sdm845-db845c is the wrong SoC. */
++	if (external_valid)
+ 		ret = qcom_parse_memory(external_fdt, false);
+-	}
++
++	if (ret < 0 && internal_valid)
++		ret = qcom_parse_memory(internal_fdt, true);
+ 
+ 	if (ret < 0)
+ 		panic("No valid memory ranges found!\n");
+@@ -123,13 +119,13 @@ int board_fdt_blob_setup(void **fdtp)
+ 	debug("ram_base = %#011lx, ram_size = %#011llx\n",
+ 	      gd->ram_base, gd->ram_size);
+ 
+-	if (internal_valid) {
+-		debug("Using built in FDT\n");
+-		ret = -EEXIST;
+-	} else {
+-		debug("Using external FDT\n");
++	if (external_valid) {
++		debug("Using external (ABL) FDT\n");
+ 		*fdtp = external_fdt;
+ 		ret = 0;
++	} else {
++		debug("Using built in FDT\n");
++		ret = -EEXIST;
+ 	}
+ 
+ #if CONFIG_IS_ENABLED(SYSRESET_PSCI)
+diff --git a/board/qualcomm/qcom-phone.env b/board/qualcomm/qcom-phone.env
+index 5eaa2cea..15c477c0 100644
+--- a/board/qualcomm/qcom-phone.env
++++ b/board/qualcomm/qcom-phone.env
+@@ -9,7 +9,7 @@ stderr=serial,vidconsole
+ fastboot=fastboot -l $fastboot_addr_r usb 0
+ 
+ # Always probe for UFS storage, though it should be done by board code.
+-preboot=scsi scan
++preboot=ufs init; scsi scan
+ 
+ # Shortcut to enable USB serial gadget and disable bootretry
+ serial_gadget=setenv stdin serial,button-kbd,usbacm; \
+@@ -21,7 +21,20 @@ serial_gadget=setenv stdin serial,button-kbd,usbacm; \
+ # bootretry will run this command over and over, if we fail once
+ # then bail out to the boot menu instead (with a pause to read
+ # the error message)
+-bootcmd=bootefi bootmgr; pause; run menucmd
++bootargs=console=ttyMSM0,115200n8 earlycon=qcom_geni,0x00a90000 root=/dev/ram0 rdinit=/init rw ignore_loglevel
++bootcmd=echo ==EL2-UBOOT: booting Linux FIT from UFS boot_b==; \
++	mw.l 0x17c10008 0; echo ==EL2-UBOOT: APSS watchdog disabled==; \
++	ufs init; scsi scan; scsi info; \
++	setenv fdt_high 0xffffffff; setenv initrd_high 0xffffffff; \
++	for d in 0 1 2 3 4 5 6 7; do \
++		if part start scsi ${d} boot_b bs && part size scsi ${d} boot_b bn; then \
++			echo FOUND boot_b on scsi ${d} start ${bs} size ${bn}; \
++			scsi dev ${d}; scsi read 0x90000000 ${bs} ${bn}; \
++			echo ==EL2-UBOOT: bootm FIT at 0x90000000 (kernel enters at EL2)==; \
++			bootm 0x90000000; \
++		fi; \
++	done; \
++	echo ==EL2-UBOOT: NO-BOOT-FIT, dropping to menu==; pause; run menucmd
+ 
+ # When entering the menu (either from button press or failed boot)
+ # remap bootcmd so it will re-open the menu and we won't get stuck
+diff --git a/tools/qcom/mkmbn/mkmbn.py b/tools/qcom/mkmbn/mkmbn.py
+index e4484b53..837c2b77 100755
+--- a/tools/qcom/mkmbn/mkmbn.py
++++ b/tools/qcom/mkmbn/mkmbn.py
+@@ -84,6 +84,7 @@ boards: dict[bytes, MbnData] = {
+     b"qcom,qcs8550\0": MbnData(0xA7000000, 7, SwId.uefi),  # C8550
+     b"qcom,sm8550\0": MbnData(0xA7000000, 7, SwId.uefi),  # C8550
+     b"qcom,sm8650\0": MbnData(0xA7000000, 7, SwId.uefi),  # SM8650
++    b"qcom,sm8250\0": MbnData(0x80040000, 6, SwId.hyp),  # nio: u-boot AS hypervisor @ EL2
+     b"qcom,qcs615\0": MbnData(0x9FC00000, 6, SwId.uefi),  # Dragonwing IQ6
+     b"qcom,ipq5424\0": MbnData(0x8a380000, 6, SwId.aboot),
+     b"qcom,ipq9574\0": MbnData(0x4A240000, 6, SwId.aboot),

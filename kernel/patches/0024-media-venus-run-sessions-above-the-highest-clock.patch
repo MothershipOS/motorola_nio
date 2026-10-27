@@ -1,0 +1,31 @@
+From: mothershipOS
+Subject: [PATCH] media: venus: run sessions whose estimated load exceeds the highest clock
+
+The core selection refused a new session (STREAMON EINVAL, "HW can't support this load") when the summed
+estimate (macroblocks x declared fps x cycles per macroblock) exceeded the highest clock. The estimate comes
+from what clients declare, and refusing breaks clients that open several sessions: Firefox in the Ubuntu VM
+(virtio-media) kept a 2160p VP9 session at a declared 60 fps (388 of 444 MHz) and every further decoder
+(ad, next video, quality switch) was refused, so YouTube videos never started. Run the session instead, the
+core at its highest clock (load_scale_v4 clamps there); real overload only slows decoding.
+
+---
+--- a/drivers/media/platform/qcom/venus/pm_helpers.c
++++ b/drivers/media/platform/qcom/venus/pm_helpers.c
+@@ -688,8 +688,15 @@
+ 		cu.video_core_enable_mask = min_lp_coreid;
+ 		move_core_to_power_save_mode(core, min_lp_coreid);
+ 	} else {
+-		dev_warn(core->dev, "HW can't support this load");
+-		return -EINVAL;
++		/*
++		 * The estimate exceeds the highest clock: run anyway, the core at its highest clock
++		 * (load_scale_v4 clamps). The load comes from what clients declare (S_PARM), not from
++		 * what they decode, and refusing a session breaks clients that open several (a
++		 * browser's ad and video, the next video preloaded); real overload only slows them.
++		 */
++		dev_warn_ratelimited(core->dev, "load above the highest clock: running at it\n");
++		inst->clk_data.core_id = min_coreid;
++		cu.video_core_enable_mask = min_coreid;
+ 	}
+ 
+ done:

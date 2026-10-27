@@ -1,0 +1,554 @@
+{
+  "id": "20261013-power-sweep",
+  "measurement_seconds": 1800,
+  "settle_seconds": 300,
+  "phone_output": "/run/mship-power-sweep-20261013",
+  "phases": [
+    {
+      "id": "s01-host-balanced",
+      "entry": "S01",
+      "label": "Host balanced baseline",
+      "mode": "host",
+      "flags": [],
+      "adopt": true
+    },
+    {
+      "id": "s02-screen-on",
+      "entry": "S02",
+      "label": "Panel on, existing brightness, touch delivery disabled",
+      "mode": "host",
+      "flags": [
+        "--screen",
+        "on"
+      ]
+    },
+    {
+      "id": "s02-screen-off",
+      "entry": "S02",
+      "label": "Panel off, touch delivery disabled",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s03-touch-enabled",
+      "entry": "S03",
+      "label": "Touch delivery enabled, panel off",
+      "mode": "host",
+      "flags": [
+        "--touch",
+        "enabled"
+      ]
+    },
+    {
+      "id": "s03-touch-disabled",
+      "entry": "S03",
+      "label": "Touch delivery disabled, panel off",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s04-minimum",
+      "entry": "S04",
+      "label": "Fixed minimum CPU caps",
+      "mode": "host",
+      "flags": [
+        "--profile",
+        "minimum"
+      ]
+    },
+    {
+      "id": "s04-powersave",
+      "entry": "S04",
+      "label": "Existing powersave profile",
+      "mode": "host",
+      "flags": [
+        "--profile",
+        "powersave"
+      ]
+    },
+    {
+      "id": "s04-balanced",
+      "entry": "S04",
+      "label": "Existing balanced profile",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s04-performance",
+      "entry": "S04",
+      "label": "Existing performance profile",
+      "mode": "host",
+      "flags": [
+        "--profile",
+        "performance"
+      ]
+    },
+    {
+      "id": "s04-balanced-after-performance",
+      "entry": "S04",
+      "label": "Balanced profile after performance",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s05-wfi-only",
+      "entry": "S05",
+      "label": "WFI-only CPU idle",
+      "mode": "host",
+      "flags": [
+        "--deep-idle",
+        "wfi-only"
+      ]
+    },
+    {
+      "id": "s05-deep-idle",
+      "entry": "S05",
+      "label": "Original deeper CPU idle enabled",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s11-poll-paused",
+      "entry": "S11",
+      "label": "Power-key recovery polling paused; host awake, USB connected",
+      "mode": "host",
+      "flags": [
+        "--pause-pwrkey-poll"
+      ]
+    },
+    {
+      "id": "s11-poll-active",
+      "entry": "S11",
+      "label": "Normal power-key recovery polling",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s13-gpu-on",
+      "entry": "S13",
+      "label": "GPU runtime suspend prevented",
+      "mode": "host",
+      "flags": [
+        "--runtime-device",
+        "gpu",
+        "--runtime-control",
+        "on"
+      ]
+    },
+    {
+      "id": "s13-gpu-auto",
+      "entry": "S13",
+      "label": "GPU normal runtime PM",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s14-wifi-ps-off",
+      "entry": "S14",
+      "label": "Wi-Fi associated, power save off",
+      "mode": "host",
+      "flags": [
+        "--wifi-power-save",
+        "off"
+      ]
+    },
+    {
+      "id": "s14-wifi-ps-on",
+      "entry": "S14",
+      "label": "Wi-Fi associated, power save on",
+      "mode": "host",
+      "flags": [
+        "--wifi-power-save",
+        "on"
+      ]
+    },
+    {
+      "id": "s14-wifi-radio-off",
+      "entry": "S14",
+      "label": "Wi-Fi radio disabled",
+      "mode": "host",
+      "flags": [
+        "--wifi-radio",
+        "off"
+      ]
+    },
+    {
+      "id": "s14-wifi-radio-on",
+      "entry": "S14",
+      "label": "Wi-Fi radio enabled and associated",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s15-ufs-on",
+      "entry": "S15",
+      "label": "UFS runtime suspend prevented",
+      "mode": "host",
+      "flags": [
+        "--runtime-device",
+        "ufs",
+        "--runtime-control",
+        "on"
+      ]
+    },
+    {
+      "id": "s15-ufs-auto",
+      "entry": "S15",
+      "label": "UFS normal runtime PM",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s15-usb-secondary-auto",
+      "entry": "S15",
+      "label": "Secondary USB controller automatic runtime PM",
+      "mode": "host",
+      "flags": [
+        "--runtime-device",
+        "usb-secondary",
+        "--runtime-control",
+        "auto"
+      ]
+    },
+    {
+      "id": "s15-usb-secondary-on",
+      "entry": "S15",
+      "label": "Original secondary USB controller power policy",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s17-usb-data-off",
+      "entry": "S17",
+      "label": "USB gadget unbound; cable connected, USB power input suspended",
+      "mode": "host",
+      "flags": [
+        "--usb-data",
+        "off"
+      ]
+    },
+    {
+      "id": "s17-usb-data-on",
+      "entry": "S17",
+      "label": "USB development data link bound and idle",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s17-usb-transfer",
+      "entry": "S17",
+      "label": "USB SSH upload at 1 MiB/s",
+      "mode": "host",
+      "flags": [],
+      "transfer": true
+    },
+    {
+      "id": "s17-usb-transfer-idle",
+      "entry": "S17",
+      "label": "USB data link idle after transfer",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s18-bluetooth-off",
+      "entry": "S18",
+      "label": "Bluetooth radio blocked",
+      "mode": "host",
+      "flags": [
+        "--bluetooth",
+        "off"
+      ]
+    },
+    {
+      "id": "s18-bluetooth-on",
+      "entry": "S18",
+      "label": "Bluetooth normal radio state",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s01-android-screen-on",
+      "entry": "S01/S02/S07",
+      "label": "Android running with panel on; Doze disabled",
+      "mode": "android",
+      "flags": [
+        "--screen",
+        "on"
+      ],
+      "vm": "android"
+    },
+    {
+      "id": "s09-android-idle",
+      "entry": "S01/S07/S09",
+      "label": "Android running, panel off, Doze disabled",
+      "mode": "android",
+      "flags": [],
+      "vm": "android"
+    },
+    {
+      "id": "s11-android-doze",
+      "entry": "S11",
+      "label": "Android panel off, forced deep Doze",
+      "mode": "doze",
+      "flags": [],
+      "vm": "android"
+    },
+    {
+      "id": "s11-android-idle-after",
+      "entry": "S11",
+      "label": "Android panel off, Doze disabled after Doze",
+      "mode": "android",
+      "flags": [],
+      "vm": "android"
+    },
+    {
+      "id": "s13-android-gpu-on",
+      "entry": "S13",
+      "label": "Android panel off; GPU runtime suspend prevented",
+      "mode": "android",
+      "flags": [
+        "--runtime-device",
+        "gpu",
+        "--runtime-control",
+        "on"
+      ],
+      "vm": "android"
+    },
+    {
+      "id": "s13-android-gpu-auto",
+      "entry": "S13",
+      "label": "Android panel off; GPU normal runtime PM",
+      "mode": "android",
+      "flags": [],
+      "vm": "android"
+    },
+    {
+      "id": "s09-host-after-android",
+      "entry": "S09",
+      "label": "Host only after clean Android shutdown",
+      "mode": "host",
+      "flags": []
+    },
+    {
+      "id": "s15-camss-on",
+      "entry": "S15",
+      "label": "Idle camera ISP (CAMSS) runtime suspend prevented",
+      "mode": "host",
+      "flags": [
+        "--runtime-device",
+        "camss",
+        "--runtime-control",
+        "on"
+      ]
+    },
+    {
+      "id": "s15-camss-auto",
+      "entry": "S15",
+      "label": "Idle camera ISP (CAMSS) normal runtime PM",
+      "mode": "host",
+      "flags": []
+    }
+  ],
+  "comparisons": [
+    {
+      "entry": "S02",
+      "label": "Panel/display path off",
+      "reference_ids": [
+        "s02-screen-on"
+      ],
+      "option_id": "s02-screen-off",
+      "note": "Existing brightness; touch disabled in both runs; includes changes in scanout/rendering."
+    },
+    {
+      "entry": "S03",
+      "label": "Touch delivery disabled",
+      "reference_ids": [
+        "s03-touch-enabled"
+      ],
+      "option_id": "s03-touch-disabled",
+      "note": "Software delivery only; does not establish controller hardware sleep or gesture wake."
+    },
+    {
+      "entry": "S04",
+      "label": "Minimum CPU caps",
+      "reference_ids": [
+        "s03-touch-disabled",
+        "s04-balanced"
+      ],
+      "option_id": "s04-minimum",
+      "note": ""
+    },
+    {
+      "entry": "S04",
+      "label": "Existing powersave profile",
+      "reference_ids": [
+        "s03-touch-disabled",
+        "s04-balanced"
+      ],
+      "option_id": "s04-powersave",
+      "note": ""
+    },
+    {
+      "entry": "S04",
+      "label": "Balanced vs performance",
+      "reference_ids": [
+        "s04-performance"
+      ],
+      "option_id": "s04-balanced-after-performance",
+      "note": ""
+    },
+    {
+      "entry": "S05",
+      "label": "Deeper CPU idle enabled",
+      "reference_ids": [
+        "s05-wfi-only"
+      ],
+      "option_id": "s05-deep-idle",
+      "note": "Only original enabled states are toggled; no physical SoC rail proof."
+    },
+    {
+      "entry": "S11",
+      "label": "Power-key polling paused",
+      "reference_ids": [
+        "s11-poll-active"
+      ],
+      "option_id": "s11-poll-paused",
+      "note": "Diagnostic only: this poll loop repairs a power-key IRQ issue; removal is not approved."
+    },
+    {
+      "entry": "S13",
+      "label": "Host GPU runtime suspend",
+      "reference_ids": [
+        "s13-gpu-on"
+      ],
+      "option_id": "s13-gpu-auto",
+      "note": ""
+    },
+    {
+      "entry": "S14",
+      "label": "Wi-Fi power saving",
+      "reference_ids": [
+        "s14-wifi-ps-off"
+      ],
+      "option_id": "s14-wifi-ps-on",
+      "note": "Associated idle host, existing AP/channel; notification and WoWLAN tests separate."
+    },
+    {
+      "entry": "S14",
+      "label": "Wi-Fi radio off",
+      "reference_ids": [
+        "s14-wifi-radio-on"
+      ],
+      "option_id": "s14-wifi-radio-off",
+      "note": "Connectivity tradeoff: disconnects Wi-Fi."
+    },
+    {
+      "entry": "S15",
+      "label": "UFS runtime suspend",
+      "reference_ids": [
+        "s15-ufs-on"
+      ],
+      "option_id": "s15-ufs-auto",
+      "note": "Logger uses RAM; ordinary system background writes may still wake storage."
+    },
+    {
+      "entry": "S15",
+      "label": "Secondary USB runtime PM",
+      "reference_ids": [
+        "s15-usb-secondary-on"
+      ],
+      "option_id": "s15-usb-secondary-auto",
+      "note": ""
+    },
+    {
+      "entry": "S17",
+      "label": "USB development data link disabled",
+      "reference_ids": [
+        "s17-usb-data-on"
+      ],
+      "option_id": "s17-usb-data-off",
+      "note": "Cable still attached; not equivalent to physically unplugged USB."
+    },
+    {
+      "entry": "S17",
+      "label": "USB transfer ended",
+      "reference_ids": [
+        "s17-usb-transfer"
+      ],
+      "option_id": "s17-usb-transfer-idle",
+      "note": "Whole-phone cost of a 1 MiB/s encrypted USB upload, including CPU work."
+    },
+    {
+      "entry": "S18",
+      "label": "Bluetooth radio off",
+      "reference_ids": [
+        "s18-bluetooth-on"
+      ],
+      "option_id": "s18-bluetooth-off",
+      "note": "Idle radio only; no calls, audio or Bluetooth wake validation."
+    },
+    {
+      "entry": "S02/S07",
+      "label": "Android display path off",
+      "reference_ids": [
+        "s01-android-screen-on"
+      ],
+      "option_id": "s09-android-idle",
+      "note": ""
+    },
+    {
+      "entry": "S11",
+      "label": "Android forced Doze",
+      "reference_ids": [
+        "s09-android-idle",
+        "s11-android-idle-after"
+      ],
+      "option_id": "s11-android-doze",
+      "note": "Uses existing guest network configuration; no automatic physical-host suspend."
+    },
+    {
+      "entry": "S13",
+      "label": "Android GPU runtime suspend",
+      "reference_ids": [
+        "s13-android-gpu-on"
+      ],
+      "option_id": "s13-android-gpu-auto",
+      "note": ""
+    },
+    {
+      "entry": "S01/S09",
+      "label": "Idle Android VM shut down",
+      "reference_ids": [
+        "s09-android-idle"
+      ],
+      "option_id": "s09-host-after-android",
+      "note": "Host workload and Android guest workload differ by definition."
+    },
+    {
+      "entry": "S15",
+      "label": "Idle camera ISP runtime suspend",
+      "reference_ids": [
+        "s15-camss-on"
+      ],
+      "option_id": "s15-camss-auto",
+      "note": "CAMSS ISP block only; sensor capture/rails and full camera operation are not established."
+    }
+  ],
+  "remaining": {
+    "S01": "Stock Android and Ubuntu Touch comparisons need separately verified measurement adapters; current sweep covers host and Android/crosvm.",
+    "S03": "Controller hardware sleep has no implemented independent switch; only existing touch delivery can be compared.",
+    "S06": "Only s2idle is advertised. Continuous CPU sampling keeps the host awake; the driver lacks a high-resolution sleep-energy counter. A 30-minute true-suspend power average needs suitable external instrumentation. No misleading awake samples will be labeled sleep power.",
+    "S07": "State propagation is a correctness issue, not an independent implemented power switch. Guest/host state snapshots are collected during Android tests.",
+    "S08": "Existing sleep blocker only matches QEMU, not crosvm. New VM lifecycle/voting behavior is not implemented; testing runs under an explicit sleep inhibitor.",
+    "S09": "Guest/host suspend coordination is not implemented. Idle VM overhead is measurable; coordinated suspend saving is not yet measurable.",
+    "S10": "Scoped guest wake-lock bridge and VM consensus protocol remain design drafts; there is no runtime on/off option.",
+    "S11": "Doze and the existing power-key polling loop are testable; broader timer batching has no implemented switch.",
+    "S12": "Physical PM8xxx RTC exposes wakealarm and wake is enabled. Guest deadline aggregation is not implemented; no independent saving can yet be assigned.",
+    "S13": "Runtime-PM savings can be measured; eliminating rendering work requires a separate implementation/performance decision.",
+    "S14": "Native host idle power save/radio-off can be measured; WoWLAN, notification delivery, and shared/native guest networking need functional tests.",
+    "S15": "GPU/UFS/CAMSS/secondary USB runtime controls are available. Sensor/camera capture, DSP/audio, interconnect and other paths need functionality and supported-control evidence.",
+    "S16": "Charging limits are preserved. The charger poll interval has no runtime tuning control; charging-current samples cannot serve as discharge-power comparisons.",
+    "S17": "USB data unbinding and active transfer are measurable with cable attached. Physical-unplug and charging-only cases cannot be inferred from them.",
+    "S18": "Bluetooth idle radio can be compared. Modem, sensors, call/SMS and audio wake paths require working integration and event tests."
+  }
+}

@@ -1,0 +1,1087 @@
+From: mothershipOS
+Subject: [PATCH] power: supply: add Qualcomm PM8150B SMB5 charger + FG gen4 fuel gauge
+
+USB charger + battery power supplies for the Motorola nio (SM8250): APSD/Type-C input current,
+stock Motorola temperature zones, charge limit (charge_control_*_threshold), inhibit-charge and
+force-discharge (USB input suspend; USB data remains independently controlled),
+fuel gauge readings incl. battery temperature from FG SRAM over DMA.
+---
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -1078,6 +1078,15 @@
+ 	  device is off or suspended, the functionality of this driver is
+ 	  limited to reporting capacity only.
+ 
++config CHARGER_QCOM_PM8150B
++	tristate "Qualcomm PM8150B SMB5 charger and FG gen4 fuel gauge"
++	depends on MFD_SPMI_PMIC || COMPILE_TEST
++	depends on IIO
++	help
++	  Charger (SMB5) and fuel gauge (FG gen4) of the Qualcomm PM8150B, as used on SM8250 phones
++	  (mothershipOS: Motorola nio). Registers a USB charger and a battery power supply, implements
++	  input current detection, temperature-zone charging and charge limits.
++
+ config CHARGER_QCOM_SMB2
+ 	tristate "Qualcomm PMI8998 PMIC charger driver"
+ 	depends on MFD_SPMI_PMIC
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -124,4 +124,5 @@
+ obj-$(CONFIG_CHARGER_SURFACE)	+= surface_charger.o
+ obj-$(CONFIG_BATTERY_UG3105)	+= ug3105_battery.o
+ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
++obj-$(CONFIG_CHARGER_QCOM_PM8150B)	+= qcom_pm8150b_charger.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
+--- /dev/null
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -0,0 +1,1050 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm PM8150B SMB5 charger + FG gen4 fuel gauge (mothershipOS / Motorola nio).
++ *
++ * One driver for both blocks of the PM8150B charger slave (SID 2), because the charging policy needs the fuel
++ * gauge readings (SoC, battery voltage, temperature):
++ *   - "pm8150b-charger" (USB): input detection (APSD + Type-C Rp), input current limit, charge enable, FCC/FV;
++ *   - "battery": monotonic SoC, voltage, current, temperature (FG SRAM over DMA), capacity, charge limits.
++ * The FG algorithm itself keeps running in the PMIC with the battery profile loaded by the stock firmware; this
++ * driver only reads it. Charging follows the stock Motorola temperature zones (qcom,mmi-temp-zones); the PMIC's
++ * own JEITA and safety timer stay enabled underneath.
++ *
++ * Register layout: downstream qpnp-smb5 / smb5-lib / qpnp-fg-gen4 (Qualcomm, GPL-2.0), structure after
++ * mainline qcom_smbx.c.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/devm-helpers.h>
++#include <linux/iio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++/* SMB5 charger peripherals */
++#define CHGR			0x1000
++#define DCDC			0x1100
++#define USBIN			0x1300
++#define TYPEC			0x1500
++
++#define BATTERY_CHARGER_STATUS_1	(CHGR + 0x06)
++#define  BATTERY_CHARGER_STATUS_MASK	GENMASK(2, 0)
++#define BATTERY_CHARGER_STATUS_2	(CHGR + 0x07)
++#define  CHARGER_ERROR_STATUS_BAT_OV_BIT	BIT(1)
++#define BATTERY_CHARGER_STATUS_7	(CHGR + 0x0d)
++#define  BAT_TEMP_STATUS_HOT_SOFT_BIT	BIT(5)
++#define  BAT_TEMP_STATUS_COLD_SOFT_BIT	BIT(4)
++#define  BAT_TEMP_STATUS_TOO_HOT_BIT	BIT(3)
++#define  BAT_TEMP_STATUS_TOO_COLD_BIT	BIT(2)
++#define CHARGING_ENABLE_CMD		(CHGR + 0x42)
++#define  CHARGING_ENABLE_CMD_BIT	BIT(0)
++#define CHGR_FAST_CHARGE_CURRENT_CFG	(CHGR + 0x61)	/* 50 mA/step */
++#define CHGR_ADC_ITERM_UP_THD_MSB	(CHGR + 0x67)
++#define CHGR_FLOAT_VOLTAGE_CFG		(CHGR + 0x70)	/* 3.6 V + 10 mV/step */
++
++#define ICL_STATUS			(DCDC + 0x07)	/* 50 mA/step */
++#define POWER_PATH_STATUS		(DCDC + 0x0b)
++#define  USBIN_SUSPEND_STS_BIT		BIT(6)
++#define  USE_USBIN_BIT			BIT(4)
++#define  VALID_INPUT_POWER_SOURCE_STS_BIT	BIT(0)
++
++#define APSD_STATUS			(USBIN + 0x07)
++#define  APSD_DTC_STATUS_DONE_BIT	BIT(0)
++#define APSD_RESULT_STATUS		(USBIN + 0x08)
++#define  QC_3P0_BIT			BIT(6)
++#define  QC_2P0_BIT			BIT(5)
++#define  FLOAT_CHARGER_BIT		BIT(4)
++#define  DCP_CHARGER_BIT		BIT(3)
++#define  CDP_CHARGER_BIT		BIT(2)
++#define  OCP_CHARGER_BIT		BIT(1)
++#define  SDP_CHARGER_BIT		BIT(0)
++#define USBIN_INT_RT_STS		(USBIN + 0x10)
++#define  USBIN_PLUGIN_RT_STS_BIT	BIT(4)
++#define USBIN_CMD_IL			(USBIN + 0x40)
++#define  USBIN_SUSPEND_BIT		BIT(0)
++#define CMD_APSD			(USBIN + 0x41)
++#define  APSD_RERUN_BIT			BIT(0)
++#define CMD_ICL_OVERRIDE		(USBIN + 0x42)
++#define  ICL_OVERRIDE_BIT		BIT(0)
++#define USBIN_LOAD_CFG			(USBIN + 0x65)
++#define  ICL_OVERRIDE_AFTER_APSD_BIT	BIT(4)
++#define USBIN_ICL_OPTIONS		(USBIN + 0x66)
++#define  CFG_USB3P0_SEL_BIT		BIT(2)
++#define  USB51_MODE_BIT			BIT(1)
++#define  USBIN_MODE_CHG_BIT		BIT(0)
++#define USBIN_CURRENT_LIMIT_CFG		(USBIN + 0x70)	/* 50 mA/step */
++#define USBIN_AICL_OPTIONS_CFG		(USBIN + 0x80)
++#define  USBIN_AICL_PERIODIC_RERUN_EN_BIT	BIT(4)
++#define  USBIN_AICL_EN_BIT		BIT(2)
++
++#define TYPE_C_SNK_STATUS		(TYPEC + 0x06)
++#define  SNK_RP_STD_BIT			BIT(3)
++#define  SNK_RP_1P5_BIT			BIT(2)
++#define  SNK_RP_3P0_BIT			BIT(1)
++
++enum { INHIBIT_CHARGE, TRICKLE_CHARGE, PRE_CHARGE, FULLON_CHARGE, TAPER_CHARGE, TERMINATE_CHARGE,
++       PAUSE_CHARGE, DISABLE_CHARGE };
++
++/* FG gen4 peripherals */
++#define FG_BATT_SOC			0x4000
++#define FG_BATT_INFO			0x4100
++#define FG_MEM_IF			0x4300
++#define BATT_SOC_FG_MONOTONIC_SOC	(FG_BATT_SOC + 0x09)
++#define BATT_INFO_VBATT_LSB		(FG_BATT_INFO + 0xa0)	/* + IBATT at 0xa2, shadow copies at 0xa6 */
++#define BATT_INFO_VBATT_LSB_CP		(FG_BATT_INFO + 0xa6)
++#define MEM_IF_INT_RT_STS		(FG_MEM_IF + 0x10)
++#define  GEN4_MEM_GNT_BIT		BIT(3)
++#define MEM_IF_MEM_ARB_CFG		(FG_MEM_IF + 0x40)
++#define  MEM_ARB_REQ_BIT		BIT(0)
++#define MEM_IF_MEM_INTF_CFG		(FG_MEM_IF + 0x50)
++#define  MEM_ACCESS_REQ_BIT		BIT(7)
++#define  IACS_SLCT_BIT			BIT(5)
++#define MEM_IF_DMA_CTL			(FG_MEM_IF + 0x71)
++#define  ADDR_KIND_BIT			BIT(1)
++
++/* FG SRAM (16-bit words), mapped for DMA into six SPMI partitions starting at 0x4400 */
++#define SRAM_BATT_TEMP_WORD		328	/* 10 bit signed, 0.25 C */
++#define SRAM_ACT_BATT_CAP_WORD		285	/* learned capacity, mAh */
++#define SRAM_NOM_CAP_WORD		271	/* nominal (profile) capacity, mAh */
++
++#define VBATT_UV_PER_LSB_NUM		122070	/* / 1000 */
++#define IBATT_UA_PER_LSB_NUM		488281	/* / 1000 */
++#define ITERM_LIMIT_MA			10000
++
++#define SDP_CURRENT_UA			500000
++#define CDP_CURRENT_UA			1500000
++#define DCP_CURRENT_UA			1500000
++#define RP_1P5_CURRENT_UA		1500000
++#define RP_3P0_CURRENT_UA		3000000
++
++#define POLL_MS				10000
++#define HYSTERESIS_DC			20	/* deci-degC */
++
++struct mmi_zone {
++	int temp_dc;		/* zone upper bound */
++	int norm_mv;		/* step voltage, 0 = no step */
++	int fcc_max_ua;		/* below norm_mv */
++	int fcc_norm_ua;	/* at/above norm_mv, 0 = stop at norm_mv */
++};
++
++struct pm8150b_chg {
++	struct device *dev;
++	struct regmap *regmap;
++	struct mutex lock;		/* hw state + SRAM access */
++	struct delayed_work work;
++	struct power_supply *usb_psy;
++	struct power_supply *batt_psy;
++	struct iio_channel *usb_in_v;
++	struct iio_channel *usb_in_i;
++	int plugin_irq;
++
++	/* configuration */
++	u32 fcc_max_ua, fv_uv, icl_max_ua, iterm_ma, design_uah, design_uv_max;
++	struct mmi_zone *zones;
++	int nzones;
++
++	/* policy state */
++	int zone;			/* -1 = cold, nzones = hot */
++	bool stepped;			/* above the zone's norm_mv */
++	int user_fcc_ua, user_icl_ua;
++	int end_threshold, start_threshold;
++	bool limit_hold;		/* charge limit reached, waiting for start_threshold */
++	bool inhibit;			/* charge_behaviour = inhibit-charge */
++	bool force_discharge;		/* suspend USB power input, retain USB data */
++	int fcc_ua, icl_ua;		/* programmed */
++	int temp_dc;			/* last battery temperature */
++	bool temp_valid;
++	const char *stop_reason;
++};
++
++/* ------------------------------------------------------------------ FG */
++static int fg_sram_read(struct pm8150b_chg *c, unsigned int word, u16 *val)
++{
++	static const struct { u16 start, end, base; } part[] = {
++		{ 0, 63, 0x4420 }, { 64, 169, 0x4520 }, { 170, 274, 0x4620 },
++		{ 275, 299, 0x4720 }, { 300, 405, 0x4820 }, { 406, 486, 0x4920 },
++	};
++	unsigned int sts, addr = 0;
++	u8 buf[2];
++	int i, rc, rel;
++
++	for (i = 0; i < ARRAY_SIZE(part); i++)
++		if (word >= part[i].start && word <= part[i].end)
++			addr = part[i].base + (word - part[i].start) * 2;
++	if (!addr)
++		return -EINVAL;
++
++	rc = regmap_update_bits(c->regmap, MEM_IF_MEM_ARB_CFG, MEM_ARB_REQ_BIT, MEM_ARB_REQ_BIT);
++	if (rc)
++		return rc;
++	rc = regmap_update_bits(c->regmap, MEM_IF_MEM_INTF_CFG, MEM_ACCESS_REQ_BIT | IACS_SLCT_BIT,
++				MEM_ACCESS_REQ_BIT);
++	if (rc)
++		goto release;
++	usleep_range(40, 50);
++	for (i = 0; i < 50; i++) {
++		rc = regmap_read(c->regmap, MEM_IF_INT_RT_STS, &sts);
++		if (rc || (sts & GEN4_MEM_GNT_BIT))
++			break;
++		usleep_range(10000, 11000);
++	}
++	if (!rc && !(sts & GEN4_MEM_GNT_BIT))
++		rc = -ETIMEDOUT;
++	if (!rc)
++		rc = regmap_bulk_read(c->regmap, addr, buf, 2);
++release:
++	rel = regmap_update_bits(c->regmap, MEM_IF_MEM_INTF_CFG, MEM_ACCESS_REQ_BIT | IACS_SLCT_BIT, 0);
++	rel |= regmap_update_bits(c->regmap, MEM_IF_MEM_ARB_CFG, MEM_ARB_REQ_BIT, 0);
++	if (!rc)
++		*val = buf[0] | buf[1] << 8;
++	return rc ?: rel;
++}
++
++static int fg_vbat_ibat(struct pm8150b_chg *c, int *uv, int *ua)
++{
++	u8 buf[4], cp[4];
++	int tries, rc;
++
++	for (tries = 0; tries < 5; tries++) {
++		rc = regmap_bulk_read(c->regmap, BATT_INFO_VBATT_LSB, buf, 4);
++		rc = rc ?: regmap_bulk_read(c->regmap, BATT_INFO_VBATT_LSB_CP, cp, 4);
++		if (rc)
++			return rc;
++		if (!memcmp(buf, cp, 4))
++			break;
++	}
++	if (uv)
++		*uv = div_u64((u64)(buf[0] | buf[1] << 8) * VBATT_UV_PER_LSB_NUM, 1000);
++	/* FG reports discharge as positive; power_supply wants charging positive */
++	if (ua)
++		*ua = -div_s64((s64)sign_extend32(buf[2] | buf[3] << 8, 15) * IBATT_UA_PER_LSB_NUM, 1000);
++	return 0;
++}
++
++static int fg_capacity(struct pm8150b_chg *c, int *pct)
++{
++	unsigned int v;
++	int rc = regmap_read(c->regmap, BATT_SOC_FG_MONOTONIC_SOC, &v);
++
++	if (!rc)
++		*pct = DIV_ROUND_CLOSEST(v * 100, 255);
++	return rc;
++}
++
++static int fg_temp(struct pm8150b_chg *c, int *dc)
++{
++	u16 raw;
++	int rc;
++
++	mutex_lock(&c->lock);
++	rc = fg_sram_read(c, SRAM_BATT_TEMP_WORD, &raw);
++	mutex_unlock(&c->lock);
++	if (!rc)
++		*dc = sign_extend32(raw, 9) * 10 / 4;
++	return rc;
++}
++
++static int fg_cap_word(struct pm8150b_chg *c, unsigned int word, int *uah)
++{
++	u16 raw;
++	int rc;
++
++	mutex_lock(&c->lock);
++	rc = fg_sram_read(c, word, &raw);
++	mutex_unlock(&c->lock);
++	if (rc)
++		return rc;
++	if (raw < 1000 || raw > 20000)	/* not learned / implausible */
++		return -ENODATA;
++	*uah = raw * 1000;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ charger hw */
++static bool usb_online(struct pm8150b_chg *c)
++{
++	unsigned int v;
++
++	if (regmap_read(c->regmap, POWER_PATH_STATUS, &v))
++		return false;
++	return (v & USE_USBIN_BIT) && (v & VALID_INPUT_POWER_SOURCE_STS_BIT);
++}
++
++static bool usb_present(struct pm8150b_chg *c)
++{
++	unsigned int v;
++
++	return !regmap_read(c->regmap, USBIN_INT_RT_STS, &v) && (v & USBIN_PLUGIN_RT_STS_BIT);
++}
++
++static int usb_type(struct pm8150b_chg *c)
++{
++	unsigned int sts, res;
++
++	if (!usb_present(c) || regmap_read(c->regmap, APSD_STATUS, &sts) || !(sts & APSD_DTC_STATUS_DONE_BIT) ||
++	    regmap_read(c->regmap, APSD_RESULT_STATUS, &res))
++		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	if (res & CDP_CHARGER_BIT)
++		return POWER_SUPPLY_USB_TYPE_CDP;
++	if (res & (DCP_CHARGER_BIT | OCP_CHARGER_BIT | QC_2P0_BIT | QC_3P0_BIT))
++		return POWER_SUPPLY_USB_TYPE_DCP;
++	if (res & SDP_CHARGER_BIT)
++		return POWER_SUPPLY_USB_TYPE_SDP;
++	return POWER_SUPPLY_USB_TYPE_UNKNOWN;	/* float */
++}
++
++/* Type-C source current advertisement (Rp), 0 = default USB power */
++static int typec_rp_ua(struct pm8150b_chg *c)
++{
++	unsigned int v;
++
++	if (regmap_read(c->regmap, TYPE_C_SNK_STATUS, &v))
++		return 0;
++	if (v & SNK_RP_3P0_BIT)
++		return RP_3P0_CURRENT_UA;
++	if (v & SNK_RP_1P5_BIT)
++		return RP_1P5_CURRENT_UA;
++	return 0;
++}
++
++static int set_icl(struct pm8150b_chg *c, int ua)
++{
++	int rc;
++
++	if (ua == c->icl_ua)
++		return 0;
++	if (ua <= SDP_CURRENT_UA) {
++		/* USB 2.0 500 mA mode */
++		rc = regmap_update_bits(c->regmap, USBIN_ICL_OPTIONS, CFG_USB3P0_SEL_BIT | USB51_MODE_BIT |
++					USBIN_MODE_CHG_BIT, USB51_MODE_BIT);
++		rc = rc ?: regmap_update_bits(c->regmap, CMD_ICL_OVERRIDE, ICL_OVERRIDE_BIT, ICL_OVERRIDE_BIT);
++		rc = rc ?: regmap_update_bits(c->regmap, USBIN_LOAD_CFG, ICL_OVERRIDE_AFTER_APSD_BIT, 0);
++	} else {
++		/* high-current mode, limit from USBIN_CURRENT_LIMIT_CFG, AICL backs off for weak adapters */
++		rc = regmap_write(c->regmap, USBIN_CURRENT_LIMIT_CFG, ua / 50000);
++		rc = rc ?: regmap_update_bits(c->regmap, USBIN_ICL_OPTIONS, USBIN_MODE_CHG_BIT,
++					      USBIN_MODE_CHG_BIT);
++		rc = rc ?: regmap_update_bits(c->regmap, CMD_ICL_OVERRIDE, ICL_OVERRIDE_BIT, 0);
++		rc = rc ?: regmap_update_bits(c->regmap, USBIN_LOAD_CFG, ICL_OVERRIDE_AFTER_APSD_BIT,
++					      ICL_OVERRIDE_AFTER_APSD_BIT);
++	}
++	rc = rc ?: regmap_update_bits(c->regmap, USBIN_CMD_IL, USBIN_SUSPEND_BIT, 0);
++	if (!rc) {
++		c->icl_ua = ua;
++		dev_info(c->dev, "input current limit %d mA\n", ua / 1000);
++	}
++	return rc;
++}
++
++static int set_fcc(struct pm8150b_chg *c, int ua)
++{
++	int rc;
++
++	ua = clamp_t(int, ua, 0, c->fcc_max_ua);
++	if (ua == c->fcc_ua)
++		return 0;
++	if (ua == 0) {
++		rc = regmap_update_bits(c->regmap, CHARGING_ENABLE_CMD, CHARGING_ENABLE_CMD_BIT, 0);
++	} else {
++		rc = regmap_write(c->regmap, CHGR_FAST_CHARGE_CURRENT_CFG, ua / 50000);
++		rc = rc ?: regmap_update_bits(c->regmap, CHARGING_ENABLE_CMD, CHARGING_ENABLE_CMD_BIT,
++					      CHARGING_ENABLE_CMD_BIT);
++	}
++	if (!rc) {
++		dev_info(c->dev, "charge current %d mA%s%s\n", ua / 1000, c->stop_reason ? " - " : "",
++			 c->stop_reason ?: "");
++		c->fcc_ua = ua;
++	}
++	return rc;
++}
++
++static int set_fv(struct pm8150b_chg *c, int uv)
++{
++	return regmap_write(c->regmap, CHGR_FLOAT_VOLTAGE_CFG, (clamp_t(int, uv, 3600000, 4790000) - 3600000) / 10000);
++}
++
++/* ------------------------------------------------------------------ policy */
++static int zone_for(struct pm8150b_chg *c, int t)
++{
++	int z = c->zone;
++
++	/* fresh pick */
++	if (z < -1 || z > c->nzones) {
++		if (t < 0)
++			return -1;
++		for (z = 0; z < c->nzones; z++)
++			if (t < c->zones[z].temp_dc)
++				return z;
++		return c->nzones;
++	}
++	/* move with hysteresis */
++	if (z == -1)
++		return t >= HYSTERESIS_DC ? 0 : -1;
++	if (z == c->nzones)
++		return t < c->zones[c->nzones - 1].temp_dc - HYSTERESIS_DC ? c->nzones - 1 : z;
++	if (t >= c->zones[z].temp_dc)
++		return z + 1;
++	if (t < (z ? c->zones[z - 1].temp_dc : 0) - HYSTERESIS_DC)
++		return z - 1;
++	return z;
++}
++
++static void pm8150b_update(struct pm8150b_chg *c)
++{
++	int t, uv, soc, icl, fcc, rp, type, fv = c->fv_uv;
++	bool present = usb_present(c);
++
++	c->stop_reason = NULL;
++	if (!fg_temp(c, &t)) {
++		c->temp_dc = t;
++		c->temp_valid = true;
++	} else {
++		c->temp_valid = false;
++	}
++	if (fg_vbat_ibat(c, &uv, NULL))
++		uv = 0;
++	if (fg_capacity(c, &soc))
++		soc = 0;
++
++	if (!present) {
++		c->icl_ua = -1;
++		c->stepped = false;
++		c->limit_hold = false;
++		return;
++	}
++
++	if (c->force_discharge) {
++		int rc;
++
++		c->stop_reason = "USB input suspended for battery discharge";
++		rc = set_fcc(c, 0);
++		rc = rc ?: regmap_update_bits(c->regmap, USBIN_CMD_IL,
++					     USBIN_SUSPEND_BIT, USBIN_SUSPEND_BIT);
++		/* The normal ICL path must clear suspend even if its limit is unchanged. */
++		c->icl_ua = -1;
++		if (rc)
++			dev_err_ratelimited(c->dev, "cannot force battery discharge: %d\n", rc);
++		return;
++	}
++
++	/* input current limit: Type-C Rp advertisement, else BC1.2 detection */
++	rp = typec_rp_ua(c);
++	type = usb_type(c);
++	if (rp)
++		icl = rp;
++	else if (type == POWER_SUPPLY_USB_TYPE_CDP)
++		icl = CDP_CURRENT_UA;
++	else if (type == POWER_SUPPLY_USB_TYPE_DCP)
++		icl = DCP_CURRENT_UA;
++	else
++		icl = SDP_CURRENT_UA;
++	icl = min3(icl, (int)c->icl_max_ua, c->user_icl_ua);
++	set_icl(c, icl);
++
++	/* temperature zones (stock Motorola table) */
++	if (!c->temp_valid) {
++		c->zone = INT_MIN;
++		fcc = min_t(int, 1000000, c->fcc_max_ua);	/* no temperature: conservative, PMIC JEITA still on */
++		c->stop_reason = "battery temperature unknown, limited";
++	} else {
++		c->zone = zone_for(c, t);
++		if (c->zone < 0) {
++			fcc = 0;
++			c->stop_reason = "battery too cold";
++		} else if (c->zone >= c->nzones) {
++			fcc = 0;
++			c->stop_reason = "battery too hot";
++		} else {
++			struct mmi_zone *z = &c->zones[c->zone];
++
++			if (z->norm_mv && uv >= z->norm_mv * 1000)
++				c->stepped = true;
++			else if (!z->norm_mv || uv < (z->norm_mv - 100) * 1000)
++				c->stepped = false;
++			fcc = c->stepped ? z->fcc_norm_ua : z->fcc_max_ua;
++			if (c->stepped && !z->fcc_norm_ua) {
++				/* hot zone: hold at the step voltage instead of charging further */
++				fv = z->norm_mv * 1000;
++				fcc = z->fcc_max_ua;
++			}
++		}
++	}
++
++	/* user charge limit (charge_control_{start,end}_threshold) and behaviour */
++	if (c->end_threshold < 100) {
++		if (soc >= c->end_threshold)
++			c->limit_hold = true;
++		else if (soc <= c->start_threshold)
++			c->limit_hold = false;
++	} else {
++		c->limit_hold = false;
++	}
++	if (c->limit_hold) {
++		fcc = 0;
++		c->stop_reason = "charge limit reached";
++	}
++	if (c->inhibit) {
++		fcc = 0;
++		c->stop_reason = "charging inhibited";
++	}
++	fcc = min(fcc, c->user_fcc_ua);
++
++	set_fv(c, fv);
++	set_fcc(c, fcc);
++}
++
++static void pm8150b_work(struct work_struct *work)
++{
++	struct pm8150b_chg *c = container_of(work, struct pm8150b_chg, work.work);
++
++	pm8150b_update(c);
++	power_supply_changed(c->usb_psy);
++	power_supply_changed(c->batt_psy);
++	schedule_delayed_work(&c->work, msecs_to_jiffies(POLL_MS));
++}
++
++static void pm8150b_kick(struct pm8150b_chg *c, unsigned int ms)
++{
++	mod_delayed_work(system_wq, &c->work, msecs_to_jiffies(ms));
++}
++
++/* ------------------------------------------------------------------ status helpers */
++static int chg_status(struct pm8150b_chg *c)
++{
++	unsigned int s1, s2;
++
++	if (!usb_online(c))
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	if (regmap_read(c->regmap, BATTERY_CHARGER_STATUS_1, &s1) ||
++	    regmap_read(c->regmap, BATTERY_CHARGER_STATUS_2, &s2))
++		return POWER_SUPPLY_STATUS_UNKNOWN;
++	if (s2 & CHARGER_ERROR_STATUS_BAT_OV_BIT)
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	switch (s1 & BATTERY_CHARGER_STATUS_MASK) {
++	case TRICKLE_CHARGE:
++	case PRE_CHARGE:
++	case FULLON_CHARGE:
++	case TAPER_CHARGE:
++		return POWER_SUPPLY_STATUS_CHARGING;
++	case TERMINATE_CHARGE:
++	case INHIBIT_CHARGE:
++		return POWER_SUPPLY_STATUS_FULL;
++	default:
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	}
++}
++
++static int chg_type(struct pm8150b_chg *c)
++{
++	unsigned int s1;
++
++	if (regmap_read(c->regmap, BATTERY_CHARGER_STATUS_1, &s1))
++		return POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
++	switch (s1 & BATTERY_CHARGER_STATUS_MASK) {
++	case TRICKLE_CHARGE:
++	case PRE_CHARGE:
++		return POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
++	case FULLON_CHARGE:
++		return POWER_SUPPLY_CHARGE_TYPE_FAST;
++	case TAPER_CHARGE:
++		return POWER_SUPPLY_CHARGE_TYPE_STANDARD;
++	default:
++		return POWER_SUPPLY_CHARGE_TYPE_NONE;
++	}
++}
++
++static int batt_health(struct pm8150b_chg *c)
++{
++	unsigned int s2, s7;
++
++	if (regmap_read(c->regmap, BATTERY_CHARGER_STATUS_2, &s2) ||
++	    regmap_read(c->regmap, BATTERY_CHARGER_STATUS_7, &s7))
++		return POWER_SUPPLY_HEALTH_UNKNOWN;
++	if (s2 & CHARGER_ERROR_STATUS_BAT_OV_BIT)
++		return POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++	if (s7 & BAT_TEMP_STATUS_TOO_HOT_BIT)
++		return POWER_SUPPLY_HEALTH_OVERHEAT;
++	if (s7 & BAT_TEMP_STATUS_TOO_COLD_BIT)
++		return POWER_SUPPLY_HEALTH_COLD;
++	if (s7 & BAT_TEMP_STATUS_HOT_SOFT_BIT)
++		return POWER_SUPPLY_HEALTH_WARM;
++	if (s7 & BAT_TEMP_STATUS_COLD_SOFT_BIT)
++		return POWER_SUPPLY_HEALTH_COOL;
++	return POWER_SUPPLY_HEALTH_GOOD;
++}
++
++/* ------------------------------------------------------------------ usb psy */
++static const enum power_supply_property usb_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
++	POWER_SUPPLY_PROP_MANUFACTURER,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++};
++
++static int usb_get(struct power_supply *psy, enum power_supply_property psp, union power_supply_propval *val)
++{
++	struct pm8150b_chg *c = power_supply_get_drvdata(psy);
++	unsigned int v;
++	int rc = 0;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		val->intval = usb_online(c);
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = usb_present(c);
++		break;
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = chg_status(c);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		val->intval = chg_type(c);
++		break;
++	case POWER_SUPPLY_PROP_USB_TYPE:
++		val->intval = typec_rp_ua(c) ? POWER_SUPPLY_USB_TYPE_C : usb_type(c);
++		break;
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		val->intval = c->user_icl_ua;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		rc = regmap_read(c->regmap, ICL_STATUS, &v);
++		val->intval = usb_online(c) ? v * 50000 : 0;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		if (!c->usb_in_v)
++			return -ENODATA;
++		rc = iio_read_channel_processed(c->usb_in_v, &val->intval);	/* prescale applied by adc5 */
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		if (!c->usb_in_i)
++			return -ENODATA;
++		rc = iio_read_channel_processed(c->usb_in_i, &val->intval);	/* scaling unverified, not wired in DT */
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		val->intval = max(c->fcc_ua, 0);
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		val->intval = min_t(int, c->user_fcc_ua, c->fcc_max_ua);
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
++		rc = regmap_read(c->regmap, CHGR_FLOAT_VOLTAGE_CFG, &v);
++		val->intval = 3600000 + v * 10000;
++		break;
++	case POWER_SUPPLY_PROP_MANUFACTURER:
++		val->strval = "Qualcomm";
++		break;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = "PM8150B SMB5";
++		break;
++	default:
++		return -EINVAL;
++	}
++	return rc;
++}
++
++static int usb_set(struct power_supply *psy, enum power_supply_property psp, const union power_supply_propval *val)
++{
++	struct pm8150b_chg *c = power_supply_get_drvdata(psy);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		c->user_icl_ua = clamp_t(int, val->intval, 0, c->icl_max_ua);
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		c->user_fcc_ua = clamp_t(int, val->intval, 0, c->fcc_max_ua);
++		break;
++	default:
++		return -EINVAL;
++	}
++	pm8150b_kick(c, 0);
++	return 0;
++}
++
++static int usb_writeable(struct power_supply *psy, enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT || psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
++}
++
++static const struct power_supply_desc usb_desc = {
++	.name = "pm8150b-charger",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) | BIT(POWER_SUPPLY_USB_TYPE_CDP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_DCP) | BIT(POWER_SUPPLY_USB_TYPE_C) |
++		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
++	.properties = usb_props,
++	.num_properties = ARRAY_SIZE(usb_props),
++	.get_property = usb_get,
++	.set_property = usb_set,
++	.property_is_writeable = usb_writeable,
++};
++
++/* ------------------------------------------------------------------ battery psy */
++static const enum power_supply_property batt_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_POWER_NOW,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++	POWER_SUPPLY_PROP_SCOPE,
++};
++
++static int batt_full_uah(struct pm8150b_chg *c)
++{
++	int uah;
++
++	if (!fg_cap_word(c, SRAM_ACT_BATT_CAP_WORD, &uah))
++		return uah;
++	return c->design_uah;
++}
++
++static int batt_get(struct power_supply *psy, enum power_supply_property psp, union power_supply_propval *val)
++{
++	struct pm8150b_chg *c = power_supply_get_drvdata(psy);
++	int rc = 0, uv, ua, soc;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = chg_status(c);
++		if (val->intval == POWER_SUPPLY_STATUS_NOT_CHARGING && !fg_capacity(c, &soc) && soc >= 100)
++			val->intval = POWER_SUPPLY_STATUS_FULL;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = batt_health(c);
++		if (val->intval == POWER_SUPPLY_HEALTH_GOOD && c->temp_valid && c->zone >= c->nzones)
++			val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;
++		else if (val->intval == POWER_SUPPLY_HEALTH_GOOD && c->temp_valid && c->zone == -1)
++			val->intval = POWER_SUPPLY_HEALTH_COLD;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		rc = fg_capacity(c, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
++		rc = fg_capacity(c, &soc);
++		val->intval = soc >= 100 ? POWER_SUPPLY_CAPACITY_LEVEL_FULL :
++			      soc >= 80 ? POWER_SUPPLY_CAPACITY_LEVEL_HIGH :
++			      soc > 15 ? POWER_SUPPLY_CAPACITY_LEVEL_NORMAL :
++			      soc > 5 ? POWER_SUPPLY_CAPACITY_LEVEL_LOW : POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		rc = fg_vbat_ibat(c, &val->intval, NULL);
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		rc = fg_vbat_ibat(c, NULL, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_POWER_NOW:
++		rc = fg_vbat_ibat(c, &uv, &ua);
++		val->intval = div_s64((s64)uv * ua, 1000000);
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		rc = fg_temp(c, &val->intval);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = c->design_uah;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		val->intval = batt_full_uah(c);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		rc = fg_capacity(c, &soc);
++		val->intval = div_u64((u64)batt_full_uah(c) * soc, 100);
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = c->design_uv_max;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		val->intval = c->start_threshold;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		val->intval = c->end_threshold;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		val->intval = c->force_discharge ? POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE :
++			      c->inhibit ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++					   POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++		break;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = "Motorola LZ50 5000 mAh";
++		break;
++	case POWER_SUPPLY_PROP_SCOPE:
++		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return rc;
++}
++
++static int batt_set(struct power_supply *psy, enum power_supply_property psp,
++		    const union power_supply_propval *val)
++{
++	struct pm8150b_chg *c = power_supply_get_drvdata(psy);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		if (val->intval < 20 || val->intval > 100)
++			return -EINVAL;
++		c->end_threshold = val->intval;
++		c->start_threshold = min(c->start_threshold, c->end_threshold - 5);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		if (val->intval < 0 || val->intval > c->end_threshold - 5)
++			return -EINVAL;
++		c->start_threshold = val->intval;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		if (val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
++		    val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE &&
++		    val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE)
++			return -EINVAL;
++		c->inhibit = val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++		c->force_discharge = val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE;
++		break;
++	default:
++		return -EINVAL;
++	}
++	pm8150b_kick(c, 0);
++	return 0;
++}
++
++static int batt_writeable(struct power_supply *psy, enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
++	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD ||
++	       psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
++}
++
++static const struct power_supply_desc batt_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = batt_props,
++	.num_properties = ARRAY_SIZE(batt_props),
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE),
++	.get_property = batt_get,
++	.set_property = batt_set,
++	.property_is_writeable = batt_writeable,
++};
++
++/* ------------------------------------------------------------------ setup */
++static irqreturn_t pm8150b_irq(int irq, void *data)
++{
++	struct pm8150b_chg *c = data;
++
++	/* plug/unplug, APSD result, ICL or charger state change: re-evaluate soon (APSD needs ~1 s) */
++	pm8150b_kick(c, irq == c->plugin_irq ? 1500 : 100);
++	power_supply_changed(c->usb_psy);
++	return IRQ_HANDLED;
++}
++
++static int pm8150b_parse_zones(struct pm8150b_chg *c)
++{
++	struct device_node *np = c->dev->of_node;
++	int i, n = of_property_count_u32_elems(np, "mmi,temp-zones");
++	u32 v[4];
++
++	if (n <= 0 || n % 4)
++		return dev_err_probe(c->dev, -EINVAL, "mmi,temp-zones: <temp_C norm_mV fcc_max_mA fcc_norm_mA>...\n");
++	c->nzones = n / 4;
++	c->zones = devm_kcalloc(c->dev, c->nzones, sizeof(*c->zones), GFP_KERNEL);
++	if (!c->zones)
++		return -ENOMEM;
++	for (i = 0; i < c->nzones; i++) {
++		of_property_read_u32_index(np, "mmi,temp-zones", i * 4, &v[0]);
++		of_property_read_u32_index(np, "mmi,temp-zones", i * 4 + 1, &v[1]);
++		of_property_read_u32_index(np, "mmi,temp-zones", i * 4 + 2, &v[2]);
++		of_property_read_u32_index(np, "mmi,temp-zones", i * 4 + 3, &v[3]);
++		c->zones[i] = (struct mmi_zone){ (s32)v[0] * 10, v[1], v[2] * 1000, v[3] * 1000 };
++		if (c->zones[i].fcc_max_ua > c->fcc_max_ua || c->zones[i].fcc_norm_ua > c->fcc_max_ua)
++			return dev_err_probe(c->dev, -EINVAL, "zone %d above the battery's FCC max\n", i);
++	}
++	return 0;
++}
++
++static int pm8150b_init_hw(struct pm8150b_chg *c)
++{
++	s16 raw;
++	u8 buf[2];
++	int rc;
++
++	/* AICL with periodic rerun (backs the ICL off on weak adapters / cables) */
++	rc = regmap_update_bits(c->regmap, USBIN_AICL_OPTIONS_CFG,
++				USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_EN_BIT,
++				USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_EN_BIT);
++	if (rc)
++		return rc;
++	/* termination current (ADC based): raw = -iterm * 32767 / 10000, big endian */
++	raw = -(s16)div_s64((s64)c->iterm_ma * 32767, ITERM_LIMIT_MA);
++	buf[0] = (u16)raw >> 8;
++	buf[1] = (u16)raw & 0xff;
++	rc = regmap_bulk_write(c->regmap, CHGR_ADC_ITERM_UP_THD_MSB, buf, 2);
++	if (rc)
++		return rc;
++	/* DMA addressing by partition for FG SRAM reads */
++	rc = regmap_update_bits(c->regmap, MEM_IF_DMA_CTL, ADDR_KIND_BIT, ADDR_KIND_BIT);
++	if (rc)
++		return rc;
++	return set_fv(c, c->fv_uv);
++}
++
++static int pm8150b_probe(struct platform_device *pdev)
++{
++	static const char * const irqs[] = { "usb-plugin", "usb-source-change", "usbin-icl-change",
++					     "chg-state-change" };
++	struct power_supply_config cfg = {};
++	struct device *dev = &pdev->dev;
++	struct pm8150b_chg *c;
++	int i, irq, rc;
++
++	c = devm_kzalloc(dev, sizeof(*c), GFP_KERNEL);
++	if (!c)
++		return -ENOMEM;
++	c->dev = dev;
++	mutex_init(&c->lock);
++	c->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!c->regmap)
++		return dev_err_probe(dev, -ENODEV, "no regmap\n");
++
++	c->fcc_max_ua = 1000000;
++	c->fv_uv = 4200000;
++	c->icl_max_ua = 3000000;
++	c->iterm_ma = 150;
++	c->design_uah = 0;
++	of_property_read_u32(dev->of_node, "constant-charge-current-max-microamp", &c->fcc_max_ua);
++	of_property_read_u32(dev->of_node, "constant-charge-voltage-max-microvolt", &c->fv_uv);
++	of_property_read_u32(dev->of_node, "input-current-limit-max-microamp", &c->icl_max_ua);
++	of_property_read_u32(dev->of_node, "charge-term-current-milliamp", &c->iterm_ma);
++	of_property_read_u32(dev->of_node, "charge-full-design-microamp-hours", &c->design_uah);
++	c->design_uv_max = c->fv_uv;
++	if (c->fv_uv > 4450000 || c->fcc_max_ua > 6000000)
++		return dev_err_probe(dev, -EINVAL, "charge limits out of range\n");
++	rc = pm8150b_parse_zones(c);
++	if (rc)
++		return rc;
++
++	c->zone = INT_MIN;
++	c->fcc_ua = -1;
++	c->icl_ua = -1;
++	c->user_fcc_ua = c->fcc_max_ua;
++	c->user_icl_ua = c->icl_max_ua;
++	c->end_threshold = 100;
++	c->start_threshold = 95;
++
++	c->usb_in_v = devm_iio_channel_get(dev, "usb_in_v");
++	if (IS_ERR(c->usb_in_v)) {
++		if (PTR_ERR(c->usb_in_v) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		c->usb_in_v = NULL;
++	}
++	c->usb_in_i = devm_iio_channel_get(dev, "usb_in_i");
++	if (IS_ERR(c->usb_in_i)) {
++		if (PTR_ERR(c->usb_in_i) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		c->usb_in_i = NULL;
++	}
++
++	rc = pm8150b_init_hw(c);
++	if (rc)
++		return dev_err_probe(dev, rc, "hw init\n");
++
++	cfg.drv_data = c;
++	cfg.fwnode = dev_fwnode(dev);
++	c->usb_psy = devm_power_supply_register(dev, &usb_desc, &cfg);
++	if (IS_ERR(c->usb_psy))
++		return dev_err_probe(dev, PTR_ERR(c->usb_psy), "usb psy\n");
++	cfg.fwnode = NULL;
++	c->batt_psy = devm_power_supply_register(dev, &batt_desc, &cfg);
++	if (IS_ERR(c->batt_psy))
++		return dev_err_probe(dev, PTR_ERR(c->batt_psy), "battery psy\n");
++
++	rc = devm_delayed_work_autocancel(dev, &c->work, pm8150b_work);
++	if (rc)
++		return rc;
++
++	for (i = 0; i < ARRAY_SIZE(irqs); i++) {
++		irq = platform_get_irq_byname(pdev, irqs[i]);
++		if (irq < 0)
++			return irq;
++		rc = devm_request_threaded_irq(dev, irq, NULL, pm8150b_irq, IRQF_ONESHOT, irqs[i], c);
++		if (rc)
++			return dev_err_probe(dev, rc, "irq %s\n", irqs[i]);
++		if (i == 0)
++			c->plugin_irq = irq;
++	}
++	devm_device_init_wakeup(dev);
++	rc = devm_pm_set_wake_irq(dev, c->plugin_irq);
++	if (rc)
++		return rc;
++
++	platform_set_drvdata(pdev, c);
++	schedule_delayed_work(&c->work, 0);
++	dev_info(dev, "PM8150B charger + FG: FCC max %u mA, FV %u mV, ICL max %u mA, %d temperature zones\n",
++		 c->fcc_max_ua / 1000, c->fv_uv / 1000, c->icl_max_ua / 1000, c->nzones);
++	return 0;
++}
++
++static int pm8150b_resume(struct device *dev)
++{
++	struct pm8150b_chg *c = dev_get_drvdata(dev);
++
++	pm8150b_kick(c, 0);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(pm8150b_pm, NULL, pm8150b_resume);
++
++static const struct of_device_id pm8150b_match[] = {
++	{ .compatible = "qcom,pm8150b-charger-fg" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, pm8150b_match);
++
++static struct platform_driver pm8150b_driver = {
++	.probe = pm8150b_probe,
++	.driver = {
++		.name = "qcom-pm8150b-charger",
++		.of_match_table = pm8150b_match,
++		.pm = pm_sleep_ptr(&pm8150b_pm),
++	},
++};
++module_platform_driver(pm8150b_driver);
++
++MODULE_DESCRIPTION("Qualcomm PM8150B SMB5 charger and FG gen4 fuel gauge");
++MODULE_LICENSE("GPL");

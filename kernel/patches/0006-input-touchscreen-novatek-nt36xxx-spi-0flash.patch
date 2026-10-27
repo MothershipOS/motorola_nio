@@ -1,0 +1,620 @@
+mothershipOS: Novatek NT36672C 0-flash SPI touchscreen (drm_panel follower, host fw download).
+Protocol from Novatek GPL reference driver (Motorola nova_0flash_mmi, kernel-work/reference/).
+
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -679,6 +679,17 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called mtouch.
+ 
++config TOUCHSCREEN_NOVATEK_NT36XXX_SPI
++	tristate "Novatek NT36xxx 0-flash SPI touchscreen"
++	depends on SPI && DRM_PANEL && OF
++	help
++	  Say Y here for Novatek NT36672C TDDI touch controllers on SPI that
++	  need their firmware downloaded by the host on every panel power-on
++	  (e.g. Motorola nio).
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called novatek-nt36xxx-spi.
++
+ config TOUCHSCREEN_NOVATEK_NVT_TS
+ 	tristate "Novatek NT11205 touchscreen support"
+ 	depends on I2C
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -70,6 +70,7 @@
+ obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
+ obj-$(CONFIG_TOUCHSCREEN_MK712)		+= mk712.o
+ obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NVT_TS)	+= novatek-nvt-ts.o
++obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NT36XXX_SPI)	+= novatek-nt36xxx-spi.o
+ obj-$(CONFIG_TOUCHSCREEN_HP600)		+= hp680_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_HP7XX)		+= jornada720_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_IPAQ_MICRO)	+= ipaq-micro-ts.o
+--- /dev/null
++++ b/drivers/input/touchscreen/novatek-nt36xxx-spi.c
+@@ -0,0 +1,584 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Novatek NT36xxx "0-flash" TDDI touchscreen over SPI (host-downloaded firmware).
++ * Currently supports the NT36672C (memory map shared with NT36675, hardware CRC v2) as used on
++ * the Motorola nio with the Tianma panel. mothershipOS.
++ *
++ * The controller shares the panel's reset and supplies and has no flash: firmware is written to its
++ * SRAM over SPI every time the panel powers on, so this driver is a drm_panel follower.
++ *
++ * Protocol and register addresses derived from Novatek's GPL-2.0 reference driver as shipped in
++ * Motorola's nova_0flash_mmi (Copyright (C) 2010 - 2018 Novatek, Inc.).
++ */
++
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#include <drm/drm_panel.h>
++
++#define NVT_MAX_TOUCHES		10
++#define NVT_XFER_MAX		(63 * 1024)
++#define NVT_POINT_LEN		65		/* 10 x 6 bytes + extra force bytes + checksum */
++
++#define NVT_ENG_RST_ADDR	0x7fff80
++#define NVT_TRIM_ADDR_V1	0x3f004
++#define NVT_TRIM_ADDR_V0	0x1f64e
++
++/* offsets inside the event buffer */
++#define EVENT_MAP_HOST_CMD	0x50
++#define EVENT_MAP_RESET_COMPLETE 0x60
++#define EVENT_MAP_FWINFO	0x78
++
++#define RESET_STATE_INIT	0xa0
++#define RESET_STATE_REK		0xa1
++#define RESET_STATE_MAX		0xaf
++
++struct nvt_chip {
++	const char *name;
++	u8 id[6];
++	u8 mask[6];
++	u32 swrst_n8_addr;
++	u32 spi_rd_fast_addr;
++	u32 event_buf_addr;
++	u32 boot_rdy_addr;
++	u32 ilm_len_addr, dlm_len_addr;
++	u32 ilm_des_addr, dlm_des_addr;
++	u32 g_ilm_crc_addr, g_dlm_crc_addr;
++	u32 bld_crc_en_addr;
++	u32 bld_ilm_dlm_crc_addr;
++};
++
++static const struct nvt_chip nt36672c_chip = {
++	.name			= "NT36672C",
++	.id			= { 0x0c, 0xff, 0xff, 0x72, 0x66, 0x03 },
++	.mask			= { 1, 0, 0, 1, 1, 1 },
++	.swrst_n8_addr		= 0x3f0fe,
++	.spi_rd_fast_addr	= 0x3f310,
++	.event_buf_addr		= 0x22d00,
++	.boot_rdy_addr		= 0x3f10d,
++	.ilm_len_addr		= 0x3f118,
++	.dlm_len_addr		= 0x3f130,
++	.ilm_des_addr		= 0x3f128,
++	.dlm_des_addr		= 0x3f12c,
++	.g_ilm_crc_addr		= 0x3f100,
++	.g_dlm_crc_addr		= 0x3f104,
++	.bld_crc_en_addr	= 0x3f30e,
++	.bld_ilm_dlm_crc_addr	= 0x3f133,
++};
++
++struct nvt_part {
++	u32 bin_addr, sram_addr, size, crc;
++};
++
++struct nvt_ts {
++	struct spi_device *spi;
++	struct input_dev *input;
++	struct touchscreen_properties prop;
++	struct drm_panel_follower follower;
++	struct work_struct fw_work;
++	struct mutex lock;		/* serialises all SPI access and page selection */
++	const struct nvt_chip *chip;
++	const char *fw_name;
++	u8 *xbuf, *rbuf;
++	size_t xfer_max;
++	bool ready;
++	int wdt_cnt;
++};
++
++/* ---- SPI primitives: byte 0 = offset within the selected 128-byte page, bit7 = write ---- */
++
++static int nvt_spi_write(struct nvt_ts *ts, u8 off, const u8 *data, size_t len)
++{
++	struct spi_transfer t = { .tx_buf = ts->xbuf, .len = len + 1 };
++
++	ts->xbuf[0] = off | 0x80;
++	memcpy(ts->xbuf + 1, data, len);
++	return spi_sync_transfer(ts->spi, &t, 1);
++}
++
++/* reads clock out one command byte and one dummy byte before the data */
++static int nvt_spi_read(struct nvt_ts *ts, u8 off, u8 *data, size_t len)
++{
++	struct spi_transfer t = { .tx_buf = ts->xbuf, .rx_buf = ts->rbuf, .len = len + 2 };
++	int ret;
++
++	memset(ts->xbuf, 0, len + 2);
++	ts->xbuf[0] = off & 0x7f;
++	ret = spi_sync_transfer(ts->spi, &t, 1);
++	if (!ret)
++		memcpy(data, ts->rbuf + 2, len);
++	return ret;
++}
++
++static int nvt_set_page(struct nvt_ts *ts, u32 addr)
++{
++	u8 b[2] = { (addr >> 15) & 0xff, (addr >> 7) & 0xff };
++
++	return nvt_spi_write(ts, 0x7f, b, 2);	/* 0xff = set page */
++}
++
++static int nvt_write_addr(struct nvt_ts *ts, u32 addr, u8 val)
++{
++	int ret = nvt_set_page(ts, addr);
++
++	return ret ?: nvt_spi_write(ts, addr & 0x7f, &val, 1);
++}
++
++static int nvt_read_addr(struct nvt_ts *ts, u32 addr, u8 *data, size_t len)
++{
++	int ret = nvt_set_page(ts, addr);
++
++	return ret ?: nvt_spi_read(ts, addr & 0x7f, data, len);
++}
++
++static void nvt_bootloader_reset(struct nvt_ts *ts)
++{
++	nvt_write_addr(ts, ts->chip->swrst_n8_addr, 0x69);
++	mdelay(5);
++	if (ts->chip->spi_rd_fast_addr)
++		nvt_write_addr(ts, ts->chip->spi_rd_fast_addr, 0x00);
++}
++
++static int nvt_wait_reset_state(struct nvt_ts *ts, u8 state, int tries)
++{
++	u8 b[5];
++	int i;
++
++	nvt_set_page(ts, ts->chip->event_buf_addr | EVENT_MAP_RESET_COMPLETE);
++	for (i = 0; i < tries; i++) {
++		if (!nvt_spi_read(ts, EVENT_MAP_RESET_COMPLETE, b, sizeof(b)) &&
++		    b[0] >= state && b[0] <= RESET_STATE_MAX)
++			return 0;
++		usleep_range(10000, 11000);
++	}
++	dev_err(&ts->spi->dev, "reset state %#x not reached (got %*ph)\n", state, 5, b);
++	return -ETIMEDOUT;
++}
++
++static int nvt_identify(struct nvt_ts *ts)
++{
++	static const u32 trim_addr[] = { NVT_TRIM_ADDR_V1, NVT_TRIM_ADDR_V0 };
++	const struct nvt_chip *c = &nt36672c_chip;
++	u8 id[6] = { };
++	int a, i, retry;
++
++	ts->chip = c;	/* reset/page helpers need the chip's addresses */
++	nvt_write_addr(ts, NVT_ENG_RST_ADDR, 0x5a);
++	msleep(10);
++	for (retry = 0; retry < 5; retry++) {
++		for (a = 0; a < ARRAY_SIZE(trim_addr); a++) {
++			nvt_bootloader_reset(ts);
++			if (nvt_read_addr(ts, trim_addr[a], id, sizeof(id)))
++				continue;
++			for (i = 0; i < 6; i++)
++				if (c->mask[i] && id[i] != c->id[i])
++					break;
++			if (i == 6) {
++				dev_info(&ts->spi->dev, "%s (trim %*ph @%#x)\n", c->name, 6, id, trim_addr[a]);
++				return 0;
++			}
++		}
++		msleep(10);
++	}
++	ts->chip = NULL;
++	dev_err(&ts->spi->dev, "unknown chip id %*ph\n", 6, id);
++	return -ENODEV;
++}
++
++/* ---- firmware: ILM, DLM, info sections and optional overlays, each copied into SRAM ---- */
++
++static int nvt_parse_fw(struct nvt_ts *ts, const struct firmware *fw,
++			struct nvt_part **parts_out, int *nparts_out)
++{
++	const u8 *d = fw->data;
++	size_t need = 0;
++	u32 end, pos;
++	int info_num = 0, ovly_num, n, i;
++	struct nvt_part *p;
++
++	/* image ends at a 4K sector carrying the "NVT"/"MOD" end flag */
++	for (i = fw->size / SZ_4K; i > 0; i--) {
++		const u8 *flag = d + i * SZ_4K - 3;
++
++		if (!memcmp(flag, "NVT", 3) || !memcmp(flag, "MOD", 3)) {
++			need = i * SZ_4K;
++			break;
++		}
++	}
++	if (!need || fw->size < 0x30)
++		return -EINVAL;
++	if (d[need - SZ_4K] + d[need - SZ_4K + 1] != 0xff)
++		return -EINVAL;
++
++	end = get_unaligned_le32(d);
++	for (pos = 0x30; pos < end; pos += 0x10)
++		info_num++;
++	ovly_num = (d[0x28] & 0x10) ? (d[0x28] & 0x0f) : 0;
++	n = 2 + info_num + ovly_num;
++
++	p = kcalloc(n, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	for (i = 0; i < n; i++) {
++		if (i < 2) {
++			p[i].bin_addr = get_unaligned_le32(d + i * 12);
++			p[i].sram_addr = get_unaligned_le32(d + 4 + i * 12);
++			p[i].size = get_unaligned_le32(d + 8 + i * 12);
++			p[i].crc = get_unaligned_le32(d + 0x18 + i * 4);
++			continue;
++		}
++		if (i < 2 + info_num)
++			pos = 0x30 + 0x10 * (i - 2);
++		else
++			pos = p[1].bin_addr + 0x10 * (i - 2 - info_num);
++		if (pos + 16 > fw->size)
++			goto bad;
++		p[i].sram_addr = get_unaligned_le32(d + pos);
++		p[i].size = get_unaligned_le32(d + pos + 4);
++		p[i].bin_addr = get_unaligned_le32(d + pos + 8);
++		p[i].crc = get_unaligned_le32(d + pos + 12);
++	}
++	for (i = 0; i < n; i++)
++		if ((u64)p[i].bin_addr + p[i].size > fw->size)
++			goto bad;
++
++	*parts_out = p;
++	*nparts_out = n;
++	return 0;
++bad:
++	kfree(p);
++	return -EINVAL;
++}
++
++static int nvt_write_sram(struct nvt_ts *ts, const struct firmware *fw, const struct nvt_part *p)
++{
++	/* the reference driver writes size + 1 bytes per partition */
++	size_t left = min_t(size_t, p->size + 1, fw->size - p->bin_addr);
++	u32 sram = p->sram_addr, bin = p->bin_addr;
++	int ret;
++
++	while (left) {
++		size_t len = min(left, ts->xfer_max);
++
++		ret = nvt_set_page(ts, sram);
++		ret = ret ?: nvt_spi_write(ts, sram & 0x7f, fw->data + bin, len);
++		if (ret)
++			return ret;
++		sram += len;
++		bin += len;
++		left -= len;
++	}
++	return 0;
++}
++
++static void nvt_set_crc_bank(struct nvt_ts *ts, u32 des, u32 sram, u32 len_addr, u32 size,
++			     u32 g_crc_addr, u32 crc)
++{
++	u8 b[4];
++
++	/* destination, length and golden CRC registers share one page */
++	nvt_set_page(ts, des);
++	b[0] = sram; b[1] = sram >> 8; b[2] = sram >> 16;
++	nvt_spi_write(ts, des & 0x7f, b, 3);
++	b[0] = size; b[1] = size >> 8; b[2] = (size >> 16) & 0x01;
++	nvt_spi_write(ts, len_addr & 0x7f, b, 3);
++	put_unaligned_le32(crc, b);
++	nvt_spi_write(ts, g_crc_addr & 0x7f, b, 4);
++}
++
++static int nvt_download(struct nvt_ts *ts, const struct firmware *fw)
++{
++	const struct nvt_chip *c = ts->chip;
++	struct nvt_part *p;
++	int n, i, retry, ret;
++	u8 v;
++
++	ret = nvt_parse_fw(ts, fw, &p, &n);
++	if (ret) {
++		dev_err(&ts->spi->dev, "bad firmware image %s\n", ts->fw_name);
++		return ret;
++	}
++
++	for (retry = 0; retry < 3; retry++) {
++		nvt_bootloader_reset(ts);
++		for (i = 0, ret = 0; i < n && !ret; i++)
++			if (p[i].size)
++				ret = nvt_write_sram(ts, fw, &p[i]);
++		if (ret)
++			continue;
++
++		nvt_set_crc_bank(ts, c->ilm_des_addr, p[0].sram_addr, c->ilm_len_addr, p[0].size,
++				 c->g_ilm_crc_addr, p[0].crc);
++		nvt_set_crc_bank(ts, c->dlm_des_addr, p[1].sram_addr, c->dlm_len_addr, p[1].size,
++				 c->g_dlm_crc_addr, p[1].crc);
++
++		/* enable bootloader hw CRC */
++		nvt_read_addr(ts, c->bld_crc_en_addr, &v, 1);
++		v |= 0x80;
++		nvt_spi_write(ts, c->bld_crc_en_addr & 0x7f, &v, 1);
++
++		/* clear reset status, enable fw CRC, then boot */
++		nvt_set_page(ts, c->event_buf_addr);
++		v = 0x00;
++		nvt_spi_write(ts, EVENT_MAP_RESET_COMPLETE, &v, 1);
++		v = 0xae;
++		nvt_spi_write(ts, EVENT_MAP_HOST_CMD, &v, 1);
++		nvt_write_addr(ts, c->boot_rdy_addr, 1);
++		mdelay(5);
++
++		ret = nvt_wait_reset_state(ts, RESET_STATE_INIT, 10);
++		if (!ret)
++			break;
++	}
++	if (ret) {
++		nvt_read_addr(ts, c->bld_ilm_dlm_crc_addr, &v, 1);
++		dev_err(&ts->spi->dev, "firmware boot failed: crc flags %#x\n", v);
++	}
++	kfree(p);
++	return ret;
++}
++
++static int nvt_read_fw_info(struct nvt_ts *ts)
++{
++	u8 b[16];
++	int ret;
++
++	ret = nvt_read_addr(ts, ts->chip->event_buf_addr | EVENT_MAP_FWINFO, b, sizeof(b));
++	if (ret)
++		return ret;
++	if (b[0] + b[1] != 0xff) {
++		dev_warn(&ts->spi->dev, "fw info broken: %*ph\n", 8, b);
++		return -EIO;
++	}
++	dev_info(&ts->spi->dev, "fw ver %u, %ux%u sensors, %ux%u, type %#x\n",
++		 b[0], b[2], b[3], get_unaligned_be16(b + 4), get_unaligned_be16(b + 6), b[13]);
++	return 0;
++}
++
++static void nvt_fw_work(struct work_struct *work)
++{
++	struct nvt_ts *ts = container_of(work, struct nvt_ts, fw_work);
++	const struct firmware *fw;
++	int ret;
++
++	ret = request_firmware(&fw, ts->fw_name, &ts->spi->dev);
++	if (ret) {
++		dev_err(&ts->spi->dev, "firmware %s: %d\n", ts->fw_name, ret);
++		return;
++	}
++
++	mutex_lock(&ts->lock);
++	ret = ts->chip ? 0 : nvt_identify(ts);
++	ret = ret ?: nvt_download(ts, fw);
++	if (!ret) {
++		nvt_read_fw_info(ts);
++		nvt_wait_reset_state(ts, RESET_STATE_REK, 50);
++		nvt_set_page(ts, ts->chip->event_buf_addr);	/* IRQ handler reads from offset 0 */
++		ts->wdt_cnt = 0;
++		ts->ready = true;
++	}
++	mutex_unlock(&ts->lock);
++	release_firmware(fw);
++
++	if (!ret) {
++		enable_irq(ts->spi->irq);
++		dev_info(&ts->spi->dev, "touch ready\n");
++	}
++}
++
++/* ---- events ---- */
++
++static irqreturn_t nvt_irq(int irq, void *data)
++{
++	struct nvt_ts *ts = data;
++	u8 d[NVT_POINT_LEN];
++	u8 sum = 0;
++	int i;
++
++	mutex_lock(&ts->lock);
++	if (!ts->ready || nvt_spi_read(ts, 0x00, d, sizeof(d)))
++		goto out;
++
++	/* 0x77 x6: firmware handshake / ESD pattern; 0xfd/0xfe x6: firmware watchdog reset */
++	if (!memchr_inv(d, 0x77, 6))
++		goto out;
++	for (i = 0; i < 6; i++)
++		if (d[i] != 0xfd && d[i] != 0xfe)
++			break;
++	if (i == 6) {
++		if (++ts->wdt_cnt > 10) {
++			dev_warn(&ts->spi->dev, "firmware watchdog reset, reloading\n");
++			ts->ready = false;
++			disable_irq_nosync(irq);
++			schedule_work(&ts->fw_work);
++		}
++		goto out;
++	}
++	ts->wdt_cnt = 0;
++
++	for (i = 0; i < NVT_POINT_LEN - 1; i++)
++		sum += d[i];
++	if ((u8)(sum + d[NVT_POINT_LEN - 1])) {
++		dev_dbg(&ts->spi->dev, "point data checksum mismatch\n");
++		goto out;
++	}
++
++	for (i = 0; i < NVT_MAX_TOUCHES; i++) {
++		const u8 *p = d + 6 * i;
++		unsigned int id = p[0] >> 3, st = p[0] & 0x07;
++		unsigned int x, y, major, pressure;
++
++		if (!id || id > NVT_MAX_TOUCHES || (st != 1 && st != 2))
++			continue;
++		x = (p[1] << 4) | (p[3] >> 4);
++		y = (p[2] << 4) | (p[3] & 0x0f);
++		major = p[4] ?: 1;
++		pressure = p[5];
++		if (i < 2)
++			pressure = min(pressure + (d[62 + i] << 8), 1000u);
++		pressure = pressure ?: 1;
++
++		input_mt_slot(ts->input, id - 1);
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
++		touchscreen_report_pos(ts->input, &ts->prop, x, y, true);
++		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR, major);
++		input_report_abs(ts->input, ABS_MT_PRESSURE, pressure);
++	}
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++out:
++	mutex_unlock(&ts->lock);
++	return IRQ_HANDLED;
++}
++
++/* ---- panel coupling ---- */
++
++static int nvt_panel_prepared(struct drm_panel_follower *f)
++{
++	struct nvt_ts *ts = container_of(f, struct nvt_ts, follower);
++
++	schedule_work(&ts->fw_work);
++	return 0;
++}
++
++static int nvt_panel_unpreparing(struct drm_panel_follower *f)
++{
++	struct nvt_ts *ts = container_of(f, struct nvt_ts, follower);
++	bool was_ready;
++
++	cancel_work_sync(&ts->fw_work);
++	mutex_lock(&ts->lock);
++	was_ready = ts->ready;
++	ts->ready = false;
++	mutex_unlock(&ts->lock);
++	if (was_ready)
++		disable_irq(ts->spi->irq);
++	input_mt_sync_frame(ts->input);	/* release any held contacts */
++	input_sync(ts->input);
++	return 0;
++}
++
++static const struct drm_panel_follower_funcs nvt_follower_funcs = {
++	.panel_prepared = nvt_panel_prepared,
++	.panel_unpreparing = nvt_panel_unpreparing,
++};
++
++static int nvt_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct nvt_ts *ts;
++	int ret;
++
++	if (!spi->irq)
++		return dev_err_probe(dev, -EINVAL, "no interrupt\n");
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++	ts->spi = spi;
++	mutex_init(&ts->lock);
++	INIT_WORK(&ts->fw_work, nvt_fw_work);
++
++	spi->mode = SPI_MODE_0;
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return dev_err_probe(dev, ret, "spi setup\n");
++
++	ts->xfer_max = min_t(size_t, NVT_XFER_MAX, spi_max_transfer_size(spi) - 1);
++	ts->xbuf = devm_kzalloc(dev, ts->xfer_max + 2, GFP_KERNEL);
++	ts->rbuf = devm_kzalloc(dev, NVT_POINT_LEN + 2 + 16, GFP_KERNEL);
++	if (!ts->xbuf || !ts->rbuf)
++		return -ENOMEM;
++
++	ts->fw_name = "novatek/nt36672c.bin";
++	of_property_read_string(dev->of_node, "firmware-name", &ts->fw_name);
++
++	ts->input = devm_input_allocate_device(dev);
++	if (!ts->input)
++		return -ENOMEM;
++	ts->input->name = "Novatek NT36672C Touchscreen";
++	ts->input->phys = "input/ts";
++	ts->input->id.bustype = BUS_SPI;
++	input_set_abs_params(ts->input, ABS_MT_POSITION_X, 0, 1079, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_POSITION_Y, 0, 2519, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
++	input_set_abs_params(ts->input, ABS_MT_PRESSURE, 0, 1000, 0, 0);
++	touchscreen_parse_properties(ts->input, true, &ts->prop);
++	ret = input_mt_init_slots(ts->input, NVT_MAX_TOUCHES, INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (ret)
++		return ret;
++	ret = input_register_device(ts->input);
++	if (ret)
++		return ret;
++
++	ret = devm_request_threaded_irq(dev, spi->irq, NULL, nvt_irq, IRQF_ONESHOT | IRQF_NO_AUTOEN,
++					"nt36xxx", ts);
++	if (ret)
++		return ret;
++
++	if (!drm_is_panel_follower(dev))
++		return dev_err_probe(dev, -EINVAL, "needs a 'panel' phandle\n");
++	ts->follower.funcs = &nvt_follower_funcs;
++	ret = devm_drm_panel_add_follower(dev, &ts->follower);
++	if (ret)
++		return dev_err_probe(dev, ret, "panel follower\n");
++	return 0;
++}
++
++static const struct of_device_id nvt_of_match[] = {
++	{ .compatible = "novatek,nt36672c-spi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, nvt_of_match);
++
++static const struct spi_device_id nvt_spi_ids[] = {
++	{ "nt36672c-spi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, nvt_spi_ids);
++
++static struct spi_driver nvt_driver = {
++	.driver = {
++		.name = "novatek-nt36xxx-spi",
++		.of_match_table = nvt_of_match,
++	},
++	.id_table = nvt_spi_ids,
++	.probe = nvt_probe,
++};
++module_spi_driver(nvt_driver);
++
++MODULE_DESCRIPTION("Novatek NT36xxx 0-flash SPI touchscreen");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,731 @@
+From: mothershipOS
+Subject: [PATCH] ASoC: qcom: q6: nio speaker path (custom AFE topologies, speaker protection feedback)
+
+The nio speaker (AW882xx with Awinic SKT protection) as stock: q6core registers the ACDB custom topology list
+(AVCS v2) with the DSP at probe (register_topologies retriggers); q6afe/q6afe-dai apply the DT custom AFE
+topologies and calibration and open the V/I feedback port (mship_skt, effective at the next start); sm8250
+runs TERTIARY_MI2S as mono 32-bit slots on SD1 with S32 stereo feedback on SD0 (mothership,tert-mi2s-s32-mono).
+See ports/nio/docs/audio.md.
+
+---
+diff --git a/sound/soc/qcom/qdsp6/q6afe-dai.c b/sound/soc/qcom/qdsp6/q6afe-dai.c
+index 0f47aad..7ba6d7a 100644
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c
+@@ -6,6 +6,7 @@
+ #include <linux/err.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/firmware.h>
+ #include <linux/device.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+@@ -25,6 +26,12 @@ struct q6afe_dai_priv_data {
+ 	uint32_t invert_sync;
+ 	uint32_t data_delay;
+ 	uint32_t data_align;
++	/* mothershipOS: custom topology/calibration and speaker-protection feedback port */
++	uint32_t topology;
++	const char *cal_fw;
++	const struct firmware *cal;
++	int fb_dai;		/* RX: id of the V/I feedback TX dai, -1 = none */
++	uint32_t fb_channels;	/* TX: feedback channels (V, I) */
+ };
+ 
+ struct q6afe_dai_data {
+@@ -382,6 +389,110 @@ static void q6afe_dai_shutdown(struct snd_pcm_substream *substream,
+ 
+ 	dai_data->is_port_started[dai->id] = false;
+ 
++	if (dai_data->priv[dai->id].fb_dai >= 0) {
++		int tx = dai_data->priv[dai->id].fb_dai;
++
++		if (dai_data->is_port_started[tx]) {
++			q6afe_port_stop(dai_data->port[tx]);
++			dai_data->is_port_started[tx] = false;
++		}
++	}
++
++}
++
++/* mothershipOS: speaker protection (custom topology/cal + V/I feedback port), effective at next start */
++static bool mship_skt = true;
++module_param(mship_skt, bool, 0644);
++MODULE_PARM_DESC(mship_skt, "Apply DT custom AFE topologies/calibration and feedback ports");
++
++static struct q6afe_dai_data *mship_dai_data;
++static bool mship_fb_plain;	/* diagnostics: start the feedback port without topology/cal */
++module_param(mship_fb_plain, bool, 0644);
++static int mship_fb_width;	/* feedback port bit width, 0 = same as RX */
++module_param(mship_fb_width, int, 0644);
++static int mship_fb_channels;	/* feedback port channels override, 0 = DT */
++module_param(mship_fb_channels, int, 0644);
++
++/* Diagnostics: "port module instance param size" -> GET_PARAM_V3 on a started port, hex to dmesg */
++static int mship_query_set(const char *val, const struct kernel_param *kp)
++{
++	u32 port, module, instance, param, size;
++	u8 *buf;
++	int ret;
++
++	if (sscanf(val, "%i %i %i %i %i", &port, &module, &instance, &param, &size) != 5 ||
++	    port >= AFE_PORT_MAX || !size || size > 2048 || !mship_dai_data)
++		return -EINVAL;
++	if (!mship_dai_data->is_port_started[port])
++		return -ENODEV;
++	buf = kzalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	ret = q6afe_port_get_param_v3(mship_dai_data->port[port], module, instance, param, buf, size);
++	pr_info("q6afe-dai query port %u %#x/%#x/%#x: %d\n", port, module, instance, param, ret);
++	if (!ret)
++		print_hex_dump(KERN_INFO, "q6afe-dai: ", DUMP_PREFIX_OFFSET, 16, 4, buf, size, false);
++	kfree(buf);
++	return ret;
++}
++static const struct kernel_param_ops mship_query_ops = { .set = mship_query_set };
++module_param_cb(mship_query, &mship_query_ops, NULL, 0200);
++
++static void q6afe_dai_custom(struct device *dev, struct q6afe_dai_data *dai_data, int id, bool on)
++{
++	struct q6afe_dai_priv_data *priv = &dai_data->priv[id];
++	struct q6afe_port *port = dai_data->port[id];
++
++	if (!on || !mship_skt) {
++		q6afe_port_set_topology(port, 0);
++		q6afe_port_set_cal(port, NULL, 0);
++		return;
++	}
++	if (priv->cal_fw && !priv->cal && request_firmware(&priv->cal, priv->cal_fw, dev))
++		dev_err(dev, "AFE cal %s missing\n", priv->cal_fw);
++	q6afe_port_set_topology(port, priv->topology);
++	if (priv->cal)
++		q6afe_port_set_cal(port, priv->cal->data, priv->cal->size);
++}
++
++/* Start the speaker-protection V/I feedback TX port that belongs to RX dai @rx (after the RX port). */
++static int q6afe_dai_start_feedback(struct snd_soc_dai *dai, struct q6afe_dai_data *dai_data, int rx)
++{
++	int tx = dai_data->priv[rx].fb_dai;
++	struct q6afe_dai_priv_data *tpriv = &dai_data->priv[tx];
++	struct q6afe_i2s_cfg cfg = dai_data->port_config[rx].i2s_cfg;
++	struct q6afe_port *port = dai_data->port[tx];
++	int rc;
++
++	if (!port) {
++		port = q6afe_port_get_from_id(dai->dev, tx);
++		if (IS_ERR(port))
++			return PTR_ERR(port);
++		dai_data->port[tx] = port;
++	}
++	if (dai_data->is_port_started[tx]) {
++		q6afe_port_stop(port);
++		dai_data->is_port_started[tx] = false;
++	}
++	cfg.num_channels = tpriv->fb_channels;	/* same rate/clocking as the RX port */
++	if (mship_fb_width)
++		cfg.bit_width = mship_fb_width;
++	if (mship_fb_channels)
++		cfg.num_channels = mship_fb_channels;
++	cfg.sd_line_mask = tpriv->sd_line_mask;
++	rc = q6afe_i2s_port_prepare(port, &cfg);
++	if (rc)
++		return rc;
++	q6afe_dai_custom(dai->dev, dai_data, tx, !mship_fb_plain);
++	q6afe_port_set_feedback(port, q6afe_port_get_dsp_id(dai_data->port[rx]), tpriv->fb_channels);
++	rc = q6afe_port_start(port);
++	if (rc) {
++		q6afe_port_set_feedback(port, 0, 0);
++		q6afe_dai_custom(dai->dev, dai_data, tx, false);
++		return rc;
++	}
++	dai_data->is_port_started[tx] = true;
++	return 0;
+ }
+ 
+ static int q6afe_dai_prepare(struct snd_pcm_substream *substream,
+@@ -435,13 +546,26 @@ static int q6afe_dai_prepare(struct snd_pcm_substream *substream,
+ 		return -EINVAL;
+ 	}
+ 
++	q6afe_dai_custom(dai->dev, dai_data, dai->id, true);
+ 	rc = q6afe_port_start(dai_data->port[dai->id]);
++	if (rc < 0 && (dai_data->priv[dai->id].topology || dai_data->priv[dai->id].cal)) {
++		dev_err(dai->dev, "AFE port %x custom topology/cal failed, starting without\n", dai->id);
++		q6afe_dai_custom(dai->dev, dai_data, dai->id, false);
++		rc = q6afe_port_start(dai_data->port[dai->id]);
++	}
+ 	if (rc < 0) {
+ 		dev_err(dai->dev, "fail to start AFE port %x\n", dai->id);
+ 		return rc;
+ 	}
+ 	dai_data->is_port_started[dai->id] = true;
+ 
++	/* as stock: V/I feedback capture starts after the protected RX port */
++	if (mship_skt && dai_data->priv[dai->id].fb_dai >= 0) {
++		rc = q6afe_dai_start_feedback(dai, dai_data, dai->id);
++		if (rc)
++			dev_err(dai->dev, "speaker protection feedback port failed (%d)\n", rc);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1027,6 +1151,7 @@ static void of_q6afe_parse_dai_data(struct device *dev,
+ 	for_each_child_of_node(dev->of_node, node) {
+ 		unsigned int lines[Q6AFE_MAX_MI2S_LINES];
+ 		struct q6afe_dai_priv_data *priv;
++		u32 fb;
+ 		int id, i, num_lines;
+ 
+ 		ret = of_property_read_u32(node, "reg", &id);
+@@ -1054,6 +1179,13 @@ static void of_q6afe_parse_dai_data(struct device *dev,
+ 			for (i = 0; i < num_lines; i++)
+ 				priv->sd_line_mask |= BIT(lines[i]);
+ 
++			of_property_read_u32(node, "mothership,afe-topology", &priv->topology);
++			of_property_read_string(node, "mothership,afe-cal", &priv->cal_fw);
++			if (!of_property_read_u32(node, "mothership,feedback-dai", &fb) && fb < AFE_PORT_MAX)
++				priv->fb_dai = fb;
++			priv->fb_channels = 2;
++			of_property_read_u32(node, "mothership,feedback-channels", &priv->fb_channels);
++
+ 			break;
+ 		case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
+ 			priv = &data->priv[id];
+@@ -1113,6 +1245,9 @@ static int q6afe_dai_dev_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	dev_set_drvdata(dev, dai_data);
++	mship_dai_data = dai_data;
++	for (num_dais = 0; num_dais < AFE_PORT_MAX; num_dais++)
++		dai_data->priv[num_dais].fb_dai = -1;
+ 	of_q6afe_parse_dai_data(dev, dai_data);
+ 
+ 	cfg.q6hdmi_ops = &q6hdmi_ops;
+diff --git a/sound/soc/qcom/qdsp6/q6afe.c b/sound/soc/qcom/qdsp6/q6afe.c
+index 7b59d51..1b807d7 100644
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -4,6 +4,7 @@
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/slab.h>
++#include <linux/unaligned.h>
+ #include <linux/kernel.h>
+ #include <linux/uaccess.h>
+ #include <linux/wait.h>
+@@ -28,6 +29,12 @@
+ #define AFE_PORT_CMD_DEVICE_START	0x000100E5
+ #define AFE_PORT_CMD_DEVICE_STOP	0x000100E6
+ #define AFE_PORT_CMD_SET_PARAM_V2	0x000100EF
++#define AFE_PORT_CMD_SET_PARAM_V3	0x000100FA
++#define AFE_PORT_CMD_GET_PARAM_V3	0x000100FB
++#define AFE_PORT_CMDRSP_GET_PARAM_V3	0x00010108
++#define AFE_PARAM_ID_SET_TOPOLOGY	0x0001025A
++#define AFE_MODULE_FEEDBACK		0x00010257
++#define AFE_PARAM_ID_FEEDBACK_PATH_CFG	0x0001022C
+ #define AFE_SVC_CMD_SET_PARAM		0x000100f3
+ #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
+ #define AFE_PARAM_ID_HDMI_CONFIG	0x00010210
+@@ -633,6 +640,13 @@ struct afe_param_id_slot_mapping_cfg {
+ struct q6afe_port {
+ 	wait_queue_head_t wait;
+ 	union afe_port_config port_cfg;
++	u32 topology_id;		/* custom AFE topology, 0 = DSP default */
++	const void *cal;		/* records: module, u16 instance, u16 rsvd, param, size, data */
++	size_t cal_size;
++	u16 fb_dst_port;		/* feedback (V/I) destination RX port, 0 = none */
++	void *get_buf;			/* GET_PARAM_V3 response: status + param header + data */
++	size_t get_len;
++	int fb_channels;
+ 	struct afe_param_id_slot_mapping_cfg *scfg;
+ 	struct aprv2_ibasic_rsp_result_t result;
+ 	int token;
+@@ -979,6 +993,8 @@ static int q6afe_callback(struct apr_device *adev, struct apr_resp_pkt *data)
+ 		}
+ 		switch (res->opcode) {
+ 		case AFE_PORT_CMD_SET_PARAM_V2:
++		case AFE_PORT_CMD_SET_PARAM_V3:
++		case AFE_PORT_CMD_GET_PARAM_V3:
+ 		case AFE_PORT_CMD_DEVICE_STOP:
+ 		case AFE_PORT_CMD_DEVICE_START:
+ 		case AFE_SVC_CMD_SET_PARAM:
+@@ -998,6 +1014,18 @@ static int q6afe_callback(struct apr_device *adev, struct apr_resp_pkt *data)
+ 		}
+ 	}
+ 		break;
++	case AFE_PORT_CMDRSP_GET_PARAM_V3:
++		port = q6afe_find_port(afe, hdr->token);
++		if (port) {
++			if (port->get_buf)
++				memcpy(port->get_buf, data->payload,
++				       min_t(size_t, data->payload_size, port->get_len));
++			port->result.opcode = AFE_PORT_CMD_GET_PARAM_V3;
++			port->result.status = data->payload_size >= 4 ? *(u32 *)data->payload : 1;
++			wake_up(&port->wait);
++			kref_put(&port->refcount, q6afe_port_free);
++		}
++		break;
+ 	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
+ 		afe->result.opcode = hdr->opcode;
+ 		afe->result.status = res->status;
+@@ -1668,6 +1696,172 @@ EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
+  *
+  * Return: Will be an negative on packet size on success.
+  */
++struct afe_port_cmd_set_param_v3 {
++	u16 port_id;
++	u16 reserved;
++	u32 payload_address_lsw;
++	u32 payload_address_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
++
++struct afe_param_hdr_v3 {
++	u32 module_id;
++	u16 instance_id;
++	u16 reserved;
++	u32 param_id;
++	u32 param_size;
++} __packed;
++
++/* In-band SET_PARAM_V3: addresses a module instance (custom topologies use non-zero instances). */
++int q6afe_port_set_param_v3(struct q6afe_port *port, u32 module_id, u16 instance_id,
++			    u32 param_id, const void *data, u32 size)
++{
++	struct afe_port_cmd_set_param_v3 *param;
++	struct afe_param_hdr_v3 *phdr;
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++	void *p;
++
++	pkt_size = APR_HDR_SIZE + sizeof(*param) + sizeof(*phdr) + ALIGN(size, 4);
++	p = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	pkt = p;
++	param = p + APR_HDR_SIZE;
++	phdr = p + APR_HDR_SIZE + sizeof(*param);
++	memcpy((void *)(phdr + 1), data, size);
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.token = port->token;
++	pkt->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V3;
++	param->port_id = port->id;
++	param->payload_size = sizeof(*phdr) + ALIGN(size, 4);
++	phdr->module_id = module_id;
++	phdr->instance_id = instance_id;
++	phdr->param_id = param_id;
++	phdr->param_size = ALIGN(size, 4);
++
++	ret = afe_apr_send_pkt(port->afe, pkt, port, AFE_PORT_CMD_SET_PARAM_V3);
++	if (ret)
++		dev_err(port->afe->dev, "port 0x%x set param %#x/%#x/%#x failed %d\n",
++			port->id, module_id, instance_id, param_id, ret);
++	kfree(pkt);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_param_v3);
++
++/* In-band GET_PARAM_V3. @buf receives the raw parameter data (up to @size bytes). */
++int q6afe_port_get_param_v3(struct q6afe_port *port, u32 module_id, u16 instance_id,
++			    u32 param_id, void *buf, u32 size)
++{
++	struct afe_port_cmd_set_param_v3 *cmd;
++	struct afe_param_hdr_v3 *phdr;
++	struct apr_pkt *pkt;
++	size_t rlen = 4 + sizeof(*phdr) + size;
++	void *p, *rsp;
++	int ret;
++
++	p = kzalloc(APR_HDR_SIZE + sizeof(*cmd) + sizeof(*phdr), GFP_KERNEL);
++	rsp = kzalloc(rlen, GFP_KERNEL);
++	if (!p || !rsp) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	pkt = p;
++	cmd = p + APR_HDR_SIZE;		/* same layout minus payload_size semantics */
++	phdr = p + APR_HDR_SIZE + sizeof(*cmd) - sizeof(u32);
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
++	pkt->hdr.pkt_size = APR_HDR_SIZE + sizeof(*cmd) - sizeof(u32) + sizeof(*phdr);
++	pkt->hdr.token = port->token;
++	pkt->hdr.opcode = AFE_PORT_CMD_GET_PARAM_V3;
++	cmd->port_id = port->id;
++	phdr->module_id = module_id;
++	phdr->instance_id = instance_id;
++	phdr->param_id = param_id;
++	phdr->param_size = size;
++	port->get_buf = rsp;
++	port->get_len = rlen;
++	ret = afe_apr_send_pkt(port->afe, pkt, port, AFE_PORT_CMD_GET_PARAM_V3);
++	port->get_buf = NULL;
++	if (!ret)
++		memcpy(buf, rsp + 4 + sizeof(*phdr), size);
++out:
++	kfree(rsp);
++	kfree(p);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_get_param_v3);
++
++void q6afe_port_set_topology(struct q6afe_port *port, u32 topology_id)
++{
++	port->topology_id = topology_id;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_topology);
++
++void q6afe_port_set_cal(struct q6afe_port *port, const void *records, size_t size)
++{
++	port->cal = records;
++	port->cal_size = size;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_cal);
++
++void q6afe_port_set_feedback(struct q6afe_port *port, u16 dst_port_id, int num_channels)
++{
++	port->fb_dst_port = dst_port_id;
++	port->fb_channels = num_channels;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_set_feedback);
++
++int q6afe_port_get_dsp_id(struct q6afe_port *port)
++{
++	return port->id;
++}
++EXPORT_SYMBOL_GPL(q6afe_port_get_dsp_id);
++
++static int q6afe_port_apply_custom(struct q6afe_port *port)
++{
++	const u8 *c = port->cal, *end = c + port->cal_size;
++	int ret;
++
++	if (port->topology_id) {
++		u32 topo[2] = { 1, port->topology_id };	/* minor_version, topology_id */
++
++		ret = q6afe_port_set_param_v2(port, topo, AFE_PARAM_ID_SET_TOPOLOGY,
++					      AFE_MODULE_AUDIO_DEV_INTERFACE, sizeof(topo));
++		if (ret) {
++			dev_err(port->afe->dev, "port 0x%x topology %#x rejected\n",
++				port->id, port->topology_id);
++			return ret;
++		}
++	}
++	while (c + 16 <= end) {
++		u32 module = get_unaligned_le32(c), param = get_unaligned_le32(c + 8);
++		u16 instance = get_unaligned_le16(c + 4);
++		u32 size = get_unaligned_le32(c + 12);
++
++		if (c + 16 + size > end)
++			return -EINVAL;
++		ret = q6afe_port_set_param_v3(port, module, instance, param, c + 16, size);
++		if (ret)
++			return ret;
++		c += 16 + ALIGN(size, 4);
++	}
++	if (port->fb_dst_port) {
++		/* dst_portid, num_channels, chan_info[4] (1 = V, 2 = I of the left speaker), minor_version */
++		u32 fb[7] = { port->fb_dst_port, port->fb_channels, 1, 2, 3, 4, 1 };
++
++		/* Only topologies that contain the generic feedback module accept this; vendor
++		 * protection modules (e.g. Awinic SKT) hand V/I over internally. Best effort. */
++		if (q6afe_port_set_param_v2(port, fb, AFE_PARAM_ID_FEEDBACK_PATH_CFG,
++					    AFE_MODULE_FEEDBACK, sizeof(fb)))
++			dev_info(port->afe->dev, "port 0x%x: no generic feedback module in topology\n",
++				 port->id);
++	}
++	return 0;
++}
++
+ int q6afe_port_start(struct q6afe_port *port)
+ {
+ 	struct afe_port_cmd_device_start *start;
+@@ -1678,6 +1872,10 @@ int q6afe_port_start(struct q6afe_port *port)
+ 	int pkt_size;
+ 	void *p;
+ 
++	ret = q6afe_port_apply_custom(port);
++	if (ret)
++		return ret;
++
+ 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+ 				       sizeof(port->port_cfg));
+diff --git a/sound/soc/qcom/qdsp6/q6afe.h b/sound/soc/qcom/qdsp6/q6afe.h
+index a29abe4..592bd9e 100644
+--- a/sound/soc/qcom/qdsp6/q6afe.h
++++ b/sound/soc/qcom/qdsp6/q6afe.h
+@@ -257,6 +257,15 @@ void q6afe_hdmi_port_prepare(struct q6afe_port *port,
+ void q6afe_slim_port_prepare(struct q6afe_port *port,
+ 			  struct q6afe_slim_cfg *cfg);
+ int q6afe_i2s_port_prepare(struct q6afe_port *port, struct q6afe_i2s_cfg *cfg);
++/* mothershipOS: custom AFE topology + calibration records + feedback path, applied at port start */
++void q6afe_port_set_topology(struct q6afe_port *port, u32 topology_id);
++void q6afe_port_set_cal(struct q6afe_port *port, const void *records, size_t size);
++void q6afe_port_set_feedback(struct q6afe_port *port, u16 dst_port_id, int num_channels);
++int q6afe_port_get_dsp_id(struct q6afe_port *port);
++int q6afe_port_get_param_v3(struct q6afe_port *port, u32 module_id, u16 instance_id,
++			    u32 param_id, void *buf, u32 size);
++int q6afe_port_set_param_v3(struct q6afe_port *port, u32 module_id, u16 instance_id,
++			    u32 param_id, const void *data, u32 size);
+ void q6afe_tdm_port_prepare(struct q6afe_port *port, struct q6afe_tdm_cfg *cfg);
+ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
+ 				struct q6afe_cdc_dma_cfg *cfg);
+diff --git a/sound/soc/qcom/qdsp6/q6core.c b/sound/soc/qcom/qdsp6/q6core.c
+index 49cfb32..3ab3d57 100644
+--- a/sound/soc/qcom/qdsp6/q6core.c
++++ b/sound/soc/qcom/qdsp6/q6core.c
+@@ -10,6 +10,9 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/jiffies.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/workqueue.h>
+ #include <linux/soc/qcom/apr.h>
+ #include "q6core.h"
+ #include "q6dsp-errno.h"
+@@ -22,6 +25,27 @@
+ #define AVCS_GET_VERSIONS_RSP   0x00012906
+ #define AVCS_CMD_GET_FWK_VERSION	0x001292c
+ #define AVCS_CMDRSP_GET_FWK_VERSION	0x001292d
++#define AVCS_CMD_REGISTER_TOPOLOGIES		0x00012923
++#define AVCS_CMD_SHARED_MEM_MAP_REGIONS		0x00012924
++#define AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00012925
++#define AVCS_CMD_SHARED_MEM_UNMAP_REGIONS	0x00012926
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL		3
++
++struct avcs_cmd_shared_mem_map {
++	u16 mem_pool_id;
++	u16 num_regions;
++	u32 property_flag;
++	u32 shm_addr_lsw;
++	u32 shm_addr_msw;
++	u32 mem_size_bytes;
++} __packed;
++
++struct avcs_cmd_register_topologies {
++	u32 payload_addr_lsw;
++	u32 payload_addr_msw;
++	u32 mem_map_handle;
++	u32 payload_size;
++} __packed;
+ 
+ struct avcs_svc_info {
+ 	uint32_t service_id;
+@@ -63,10 +87,32 @@ struct q6core {
+ 	bool get_state_supported;
+ 	bool get_version_supported;
+ 	bool is_version_requested;
++	/* mothershipOS: custom topology registration (ACDB AVCS topology list) */
++	struct work_struct topo_work;
++	const char *topo_fw;
++	u32 last_opcode;
++	u32 last_status;
++	u32 mem_map_handle;
++	bool topo_rsp;
+ };
+ 
+ static struct q6core *g_core;
+ 
++/* mothershipOS: register custom topologies at probe; writing 1 to register_topologies retriggers */
++static bool mship_topologies = true;
++module_param(mship_topologies, bool, 0644);
++MODULE_PARM_DESC(mship_topologies, "Register DT custom topologies with the DSP at probe");
++
++static int q6core_register_now(const char *val, const struct kernel_param *kp)
++{
++	if (!g_core || !g_core->topo_fw)
++		return -ENODEV;
++	schedule_work(&g_core->topo_work);
++	return 0;
++}
++static const struct kernel_param_ops q6core_register_ops = { .set = q6core_register_now };
++module_param_cb(register_topologies, &q6core_register_ops, NULL, 0200);
++
+ static int q6core_callback(struct apr_device *adev, struct apr_resp_pkt *data)
+ {
+ 	struct q6core *core = dev_get_drvdata(&adev->dev);
+@@ -93,6 +139,14 @@ static int q6core_callback(struct apr_device *adev, struct apr_resp_pkt *data)
+ 				core->get_state_supported = false;
+ 			core->resp_received = true;
+ 			break;
++	case AVCS_CMD_REGISTER_TOPOLOGIES:
++		case AVCS_CMD_SHARED_MEM_UNMAP_REGIONS:
++		case AVCS_CMD_SHARED_MEM_MAP_REGIONS:
++			core->last_opcode = result->opcode;
++			core->last_status = result->status;
++			core->topo_rsp = true;
++			wake_up(&core->wait);
++			break;
+ 		}
+ 		break;
+ 	}
+@@ -130,6 +184,13 @@ static int q6core_callback(struct apr_device *adev, struct apr_resp_pkt *data)
+ 
+ 		break;
+ 	}
++	case AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS:
++		core->mem_map_handle = *(u32 *)data->payload;
++		core->last_opcode = AVCS_CMD_SHARED_MEM_MAP_REGIONS;
++		core->last_status = 0;
++		core->topo_rsp = true;
++		wake_up(&core->wait);
++		break;
+ 	case AVCS_CMDRSP_ADSP_EVENT_GET_STATE:
+ 		core->get_state_supported = true;
+ 		core->avcs_state = result->opcode;
+@@ -325,6 +386,86 @@ bool q6core_is_adsp_ready(void)
+ }
+ EXPORT_SYMBOL_GPL(q6core_is_adsp_ready);
+ 
++static int q6core_topo_cmd(struct q6core *core, u32 opcode, const void *payload, size_t len)
++{
++	struct apr_pkt *pkt;
++	int ret, size = APR_HDR_SIZE + len;
++
++	pkt = kzalloc(size, GFP_KERNEL);
++	if (!pkt)
++		return -ENOMEM;
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
++	pkt->hdr.pkt_size = size;
++	pkt->hdr.opcode = opcode;
++	memcpy(pkt->payload, payload, len);
++	core->topo_rsp = false;
++	ret = apr_send_pkt(core->adev, pkt);
++	kfree(pkt);
++	if (ret < 0)
++		return ret;
++	if (!wait_event_timeout(core->wait, core->topo_rsp, msecs_to_jiffies(1000)))
++		return -ETIMEDOUT;
++	if (core->last_opcode != opcode || core->last_status)
++		return -EIO;
++	return 0;
++}
++
++/*
++ * mothershipOS: register the ACDB custom topology list (AVCS v2 definitions) with the DSP, as the
++ * Android ACDB loader does at boot. AFE ports can then select e.g. the speaker-protection topologies.
++ */
++static void q6core_topo_work(struct work_struct *work)
++{
++	struct q6core *core = container_of(work, struct q6core, topo_work);
++	struct device *dev = &core->adev->dev;
++	struct avcs_cmd_register_topologies reg = {};
++	struct avcs_cmd_shared_mem_map map = {};
++	const struct firmware *fw;
++	size_t len;
++	dma_addr_t pa;
++	void *buf;
++	int ret;
++
++	if (!q6core_is_adsp_ready()) {
++		dev_err(dev, "custom topologies: ADSP not ready\n");
++		return;
++	}
++	ret = request_firmware(&fw, core->topo_fw, dev);
++	if (ret)
++		return;
++	len = PAGE_ALIGN(fw->size);
++	dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	buf = dma_alloc_coherent(dev, len, &pa, GFP_KERNEL);
++	if (!buf) {
++		release_firmware(fw);
++		return;
++	}
++	memcpy(buf, fw->data, fw->size);
++
++	map.mem_pool_id = ADSP_MEMORY_MAP_SHMEM8_4K_POOL;
++	map.num_regions = 1;
++	map.shm_addr_lsw = lower_32_bits(pa);
++	map.shm_addr_msw = upper_32_bits(pa);
++	map.mem_size_bytes = len;
++	mutex_lock(&core->lock);
++	ret = q6core_topo_cmd(core, AVCS_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map));
++	if (!ret) {
++		reg.payload_addr_lsw = lower_32_bits(pa);
++		reg.payload_addr_msw = upper_32_bits(pa);
++		reg.mem_map_handle = core->mem_map_handle;
++		reg.payload_size = fw->size;
++		ret = q6core_topo_cmd(core, AVCS_CMD_REGISTER_TOPOLOGIES, &reg, sizeof(reg));
++		dev_info(dev, "custom topologies %s (%zu bytes): %d (status %#x)\n",
++			 core->topo_fw, fw->size, ret, core->last_status);
++		q6core_topo_cmd(core, AVCS_CMD_SHARED_MEM_UNMAP_REGIONS, &core->mem_map_handle, 4);
++	} else {
++		dev_err(dev, "custom topologies: memory map failed %d\n", ret);
++	}
++	mutex_unlock(&core->lock);
++	dma_free_coherent(dev, len, buf, pa);
++	release_firmware(fw);
++}
++
+ static int q6core_probe(struct apr_device *adev)
+ {
+ 	g_core = kzalloc(sizeof(*g_core), GFP_KERNEL);
+@@ -336,6 +477,10 @@ static int q6core_probe(struct apr_device *adev)
+ 	mutex_init(&g_core->lock);
+ 	g_core->adev = adev;
+ 	init_waitqueue_head(&g_core->wait);
++	INIT_WORK(&g_core->topo_work, q6core_topo_work);
++	if (!of_property_read_string(adev->dev.of_node, "mothership,custom-topologies",
++				     &g_core->topo_fw) && mship_topologies)
++		schedule_work(&g_core->topo_work);
+ 	return 0;
+ }
+ 
+@@ -343,6 +488,7 @@ static void q6core_exit(struct apr_device *adev)
+ {
+ 	struct q6core *core = dev_get_drvdata(&adev->dev);
+ 
++	cancel_work_sync(&core->topo_work);
+ 	if (core->fwk_version_supported)
+ 		kfree(core->fwk_version);
+ 	if (core->get_version_supported)
+diff --git a/sound/soc/qcom/qdsp6/q6routing.c b/sound/soc/qcom/qdsp6/q6routing.c
+index f49243d..8eb1e7e 100644
+--- a/sound/soc/qcom/qdsp6/q6routing.c
++++ b/sound/soc/qcom/qdsp6/q6routing.c
+@@ -1085,6 +1085,10 @@ static int routing_hw_params(struct snd_soc_component *component,
+ 	case SNDRV_PCM_FORMAT_S24_LE:
+ 			session->bits_per_sample = 24;
+ 		break;
++	case SNDRV_PCM_FORMAT_S32_LE:
++		/* ADM COPPs top out at 24 bits; the AFE port itself still runs 32-bit */
++		session->bits_per_sample = 24;
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/sound/soc/qcom/sm8250.c b/sound/soc/qcom/sm8250.c
+index 372bdb3..e539148 100644
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -69,6 +69,15 @@ static int sm8250_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 	channels->min = channels->max = 2;
+ 	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
+ 
++	/* mothershipOS nio: AW882xx speaker with Awinic SKT protection, as stock: mono 32-bit slots on SD1,
++	 * V/I feedback S32 stereo on SD0 (64fs frame shared by both directions). */
++	if (snd_soc_rtd_to_cpu(rtd, 0)->id == TERTIARY_MI2S_RX &&
++	    of_property_read_bool(rtd->card->dev->of_node, "mothership,tert-mi2s-s32-mono")) {
++		channels->min = channels->max = 1;
++		snd_mask_none(fmt);
++		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S32_LE);	/* Awinic SKT: 16 or 32 bit only */
++	}
++
+ 	return 0;
+ }
+ 
+@@ -101,7 +110,8 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
+ 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+ 		snd_soc_dai_set_sysclk(cpu_dai,
+ 			Q6AFE_LPASS_CLK_ID_TER_MI2S_IBIT,
+-			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
++			of_property_read_bool(rtd->card->dev->of_node, "mothership,tert-mi2s-s32-mono") ?
++			2 * MI2S_BCLK_RATE : MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
+ 		snd_soc_dai_set_fmt(cpu_dai, fmt);
+ 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+ 		break;

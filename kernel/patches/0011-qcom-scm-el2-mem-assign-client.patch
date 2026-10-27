@@ -1,0 +1,27 @@
+--- a/drivers/firmware/qcom/qcom_scm-smc.c
++++ b/drivers/firmware/qcom/qcom_scm-smc.c
+@@ -15,6 +15,7 @@
+ #include <linux/dma-mapping.h>
+ 
+ #include "qcom_scm.h"
++#include <asm/virt.h>
+ 
+ /**
+  * struct arm_smccc_args
+@@ -207,6 +208,16 @@
+ 		smc.args[SCM_SMC_LAST_REG_IDX] = qcom_tzmem_to_phys(args_virt);
+ 	}
+ 
++	/*
++	 * With QHEE replaced by an EL2 Linux host, MEM_ASSIGN still consumes
++	 * HLOS-owned descriptor buffers. QHEE normally forwards these calls
++	 * with x7=HLOS; x7=0 makes TZ validate the extended array as HYP-owned
++	 * and returns -6 before reaching the assignment handler.
++	 */
++	if (is_kernel_in_hyp_mode() && desc->svc == QCOM_SCM_SVC_MP &&
++	    desc->cmd == QCOM_SCM_MP_ASSIGN)
++		smc.args[7] = QCOM_SCM_VMID_HLOS;
++
+ 	ret = __scm_smc_do(dev, &smc, &smc_res, atomic);
+ 
+ 	trace_scm_smc_done(ret, smc.args[0], &smc_res);

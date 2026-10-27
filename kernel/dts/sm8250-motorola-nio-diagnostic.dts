@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* RAM-only fastboot diagnostic variant; preserves the downstream ramoops layout. */
+#include "sm8250-motorola-nio.dts"
+#include "sm8250-motorola-nio-abl-sink.dtsi"
+
+&{/chosen} {
+	/*
+	 * Diagnostic parameters live here, not in the boot image header: MBM
+	 * sizes its command-line buffer from the v3 header cmdline field, so a
+	 * non-empty v2 header cmdline overflows it (SafeString.c:786 assert).
+	 * ABL prepends bootargs to the final command line. No earlycon/UART
+	 * console: UART12 is unreachable and may be unclocked at entry.
+	 */
+	bootargs = "rdinit=/init console=tty0 fbcon=font:TER16x32 loglevel=8 ignore_loglevel panic=10 nokaslr maxcpus=1 clk_ignore_unused pd_ignore_unused regulator_ignore_unused reboot=warm";
+};
+
+&ramoops_mem {
+	compatible = "ramoops";
+	console-size = <0x40000>;
+	pmsg-size = <0x40000>;
+	/* Both vendor and upstream round this down to 0x20000. */
+	record-size = <0x3f800>;
+};

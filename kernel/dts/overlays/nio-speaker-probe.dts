@@ -1,0 +1,18 @@
+/dts-v1/;
+/plugin/;
+/ {
+ fragment@0 {
+  target-path = "/soc@0/geniqup@8c0000/i2c@884000";
+  __overlay__ {
+   #address-cells = <1>;
+   #size-cells = <0>;
+   speaker@34 {
+    compatible = "mothership,nio-aw882xx";
+    reg = <0x34>;
+    /* Live nio base DT pins TLMM phandle 0x55; active-low reset. */
+    reset-gpios = <0x55 139 1>;
+    #sound-dai-cells = <0>;
+   };
+  };
+ };
+};

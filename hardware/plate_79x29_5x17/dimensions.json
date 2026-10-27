@@ -1,0 +1,29 @@
+{
+  "units": "mm",
+  "dimensions": [
+    79.0,
+    29.5,
+    17.0
+  ],
+  "hole_diameter": 5.0,
+  "hole_spacing_center_to_center": 60.0,
+  "hole_centers_xy": [
+    [
+      -30.0,
+      0.0
+    ],
+    [
+      30.0,
+      0.0
+    ]
+  ],
+  "hole_center_distance_from_each_end": 9.5,
+  "holes": "two straight through-holes, centered across the width",
+  "top_view_corner_radius": 2.0,
+  "top_and_bottom_edges": "square",
+  "hole_edges": "sharp",
+  "solid_valid": true,
+  "stl_watertight": true,
+  "step_roundtrip_valid": true,
+  "volume_mm3": 38892.539861556266
+}

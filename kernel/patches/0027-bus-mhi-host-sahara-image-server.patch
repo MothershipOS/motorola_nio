@@ -1,0 +1,1086 @@
+From: mothershipOS
+Subject: [PATCH] bus: mhi: host: Sahara image server
+
+An MHI client on the SAHARA channel that serves a modem's boot images from the firmware directory by Sahara image
+ID (module parameters images="id:file,..." and fw_dir, default the SDX55 map and qcom/sdx55m; "@/path" entries
+read a file or block device raw: the EFS partitions). Derived from
+drivers/accel/qaic/sahara.c (Sahara 2.x protocol, memory debug to devcoredump), which is tied to the AIC
+accelerators.
+
+It also serves the EFS channel: in mission mode a flashless SDX55 syncs its NV back over Sahara memory debug, with
+the 32-bit MEM_DEBUG/MEM_READ commands qaic's code lacks; the region (an mdm1m9kefs image) becomes a devcoredump.
+An unanswered sync makes the modem raise errfatal about 15 s later.
+
+---
+diff --git a/drivers/bus/mhi/host/Kconfig b/drivers/bus/mhi/host/Kconfig
+--- a/drivers/bus/mhi/host/Kconfig
++++ b/drivers/bus/mhi/host/Kconfig
+@@ -29,3 +29,11 @@
+ 	  This driver provides MHI PCI controller driver for devices such as
+ 	  Qualcomm SDX55 based PCIe modems.
+ 
++
++config MHI_SAHARA
++	tristate "MHI Sahara image server"
++	depends on MHI_BUS
++	help
++	  Serves the boot images of a modem without flash over its MHI SAHARA
++	  channel (an SDX55 inside a phone), from the firmware directory and
++	  the modem's NV partitions.
+diff --git a/drivers/bus/mhi/host/Makefile b/drivers/bus/mhi/host/Makefile
+--- a/drivers/bus/mhi/host/Makefile
++++ b/drivers/bus/mhi/host/Makefile
+@@ -4,3 +4,5 @@
+ 
+ obj-$(CONFIG_MHI_BUS_PCI_GENERIC) += mhi_pci_generic.o
+ mhi_pci_generic-y += pci_generic.o
++
++obj-$(CONFIG_MHI_SAHARA) += mhi_sahara.o
+diff --git a/drivers/bus/mhi/host/mhi_sahara.c b/drivers/bus/mhi/host/mhi_sahara.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/bus/mhi/host/mhi_sahara.c
+@@ -0,0 +1,1043 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++/* Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved. */
++
++/*
++ * MHI Sahara image server for modems that boot from the host (derived from drivers/accel/qaic/sahara.c).
++ * A modem without flash (an SDX55 inside a phone) asks for each image of its boot chain by Sahara image ID
++ * on the SAHARA channel; this answers from the firmware directory ("fw_dir", default qcom/sdx55m) with the
++ * ID map "images" ("id:file,..."; default: the SDX55 map). An entry "@/path" reads a file or a block device
++ * raw (the modem's NV/EFS in the phone's own partitions, always current), "=zero:N" is N zero bytes. Served
++ * images and unknown IDs are logged. Memory debug mode (a crashed modem) collects a devcoredump as in qaic.
++ * The SDX55 map is the alioth (Xiaomi Poco F3) one, github.com/cancelledbit/alioth-modem.
++ */
++
++#include <linux/devcoredump.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/firmware.h>
++#include <linux/limits.h>
++#include <linux/mhi.h>
++#include <linux/minmax.h>
++#include <linux/mod_devicetable.h>
++#include <linux/overflow.h>
++#include <linux/types.h>
++#include <linux/vmalloc.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#define SAHARA_HELLO_CMD		0x1  /* Min protocol version 1.0 */
++#define SAHARA_HELLO_RESP_CMD		0x2  /* Min protocol version 1.0 */
++#define SAHARA_READ_DATA_CMD		0x3  /* Min protocol version 1.0 */
++#define SAHARA_END_OF_IMAGE_CMD		0x4  /* Min protocol version 1.0 */
++#define SAHARA_DONE_CMD			0x5  /* Min protocol version 1.0 */
++#define SAHARA_DONE_RESP_CMD		0x6  /* Min protocol version 1.0 */
++#define SAHARA_RESET_CMD		0x7  /* Min protocol version 1.0 */
++#define SAHARA_RESET_RESP_CMD		0x8  /* Min protocol version 1.0 */
++#define SAHARA_MEM_DEBUG_CMD		0x9  /* Min protocol version 2.0 */
++#define SAHARA_MEM_READ_CMD		0xa  /* Min protocol version 2.0 */
++#define SAHARA_CMD_READY_CMD		0xb  /* Min protocol version 2.1 */
++#define SAHARA_SWITCH_MODE_CMD		0xc  /* Min protocol version 2.1 */
++#define SAHARA_EXECUTE_CMD		0xd  /* Min protocol version 2.1 */
++#define SAHARA_EXECUTE_RESP_CMD		0xe  /* Min protocol version 2.1 */
++#define SAHARA_EXECUTE_DATA_CMD		0xf  /* Min protocol version 2.1 */
++#define SAHARA_MEM_DEBUG64_CMD		0x10 /* Min protocol version 2.5 */
++#define SAHARA_MEM_READ64_CMD		0x11 /* Min protocol version 2.5 */
++#define SAHARA_READ_DATA64_CMD		0x12 /* Min protocol version 2.8 */
++#define SAHARA_RESET_STATE_CMD		0x13 /* Min protocol version 2.9 */
++#define SAHARA_WRITE_DATA_CMD		0x14 /* Min protocol version 3.0 */
++
++#define SAHARA_PACKET_MAX_SIZE		0xffffU /* MHI_MAX_MTU */
++#define SAHARA_TRANSFER_MAX_SIZE	0x80000
++/*
++ * Data answers stream through a pool of packets, one transfer each, reused once the device has taken them: the
++ * SDX55 asks for whole images in one read (its 76 MB modem DSP), far beyond any ring.
++ */
++#define SAHARA_DATA_BUFS		64
++#define SAHARA_READ_MAX_SIZE		0xfff0U /* Avoid unaligned requests */
++#define SAHARA_NUM_TX_BUF		DIV_ROUND_UP(SAHARA_TRANSFER_MAX_SIZE,\
++							SAHARA_PACKET_MAX_SIZE)
++#define SAHARA_IMAGE_ID_NONE		U32_MAX
++
++#define SAHARA_VERSION			2
++#define SAHARA_SUCCESS			0
++#define SAHARA_TABLE_ENTRY_STR_LEN	20
++
++#define SAHARA_MODE_IMAGE_TX_PENDING	0x0
++#define SAHARA_MODE_IMAGE_TX_COMPLETE	0x1
++#define SAHARA_MODE_MEMORY_DEBUG	0x2
++#define SAHARA_MODE_COMMAND		0x3
++
++#define SAHARA_HELLO_LENGTH		0x30
++#define SAHARA_READ_DATA_LENGTH		0x14
++#define SAHARA_READ_DATA64_LENGTH	0x20
++#define SAHARA_SWITCH_MODE_LENGTH	0xc
++#define SAHARA_END_OF_IMAGE_LENGTH	0x10
++#define SAHARA_DONE_LENGTH		0x8
++#define SAHARA_RESET_LENGTH		0x8
++#define SAHARA_MEM_DEBUG_LENGTH		0x10
++#define SAHARA_MEM_READ_LENGTH		0x10
++#define SAHARA_MEM_DEBUG64_LENGTH	0x18
++#define SAHARA_MEM_READ64_LENGTH	0x18
++
++struct sahara_packet {
++	__le32 cmd;
++	__le32 length;
++
++	union {
++		struct {
++			__le32 version;
++			__le32 version_compat;
++			__le32 max_length;
++			__le32 mode;
++		} hello;
++		struct {
++			__le32 version;
++			__le32 version_compat;
++			__le32 status;
++			__le32 mode;
++		} hello_resp;
++		struct {
++			__le32 image;
++			__le32 offset;
++			__le32 length;
++		} read_data;
++		struct {
++			__le32 image;
++			__le32 status;
++		} end_of_image;
++		struct {
++			__le64 image;
++			__le64 offset;
++			__le64 length;
++		} read_data64;
++		struct {
++			__le32 mode;
++		} switch_mode;
++		struct {
++			__le32 table_address;
++			__le32 table_length;
++		} memory_debug;
++		struct {
++			__le32 memory_address;
++			__le32 memory_length;
++		} memory_read;
++		struct {
++			__le64 table_address;
++			__le64 table_length;
++		} memory_debug64;
++		struct {
++			__le64 memory_address;
++			__le64 memory_length;
++		} memory_read64;
++	};
++};
++
++struct sahara_debug_table_entry64 {
++	__le64	type;
++	__le64	address;
++	__le64	length;
++	char	description[SAHARA_TABLE_ENTRY_STR_LEN];
++	char	filename[SAHARA_TABLE_ENTRY_STR_LEN];
++};
++
++/* the 32-bit table: an SDX55 in mission mode hands its EFS over with it */
++struct sahara_debug_table_entry32 {
++	__le32	type;
++	__le32	address;
++	__le32	length;
++	char	description[SAHARA_TABLE_ENTRY_STR_LEN];
++	char	filename[SAHARA_TABLE_ENTRY_STR_LEN];
++} __packed;
++
++struct sahara_dump_table_entry {
++	u64	type;
++	u64	address;
++	u64	length;
++	char	description[SAHARA_TABLE_ENTRY_STR_LEN];
++	char	filename[SAHARA_TABLE_ENTRY_STR_LEN];
++};
++
++#define SAHARA_DUMP_V1_MAGIC 0x1234567890abcdef
++#define SAHARA_DUMP_V1_VER   1
++struct sahara_memory_dump_meta_v1 {
++	u64	magic;
++	u64	version;
++	u64	dump_size;
++	u64	table_size;
++};
++
++/*
++ * Layout of crashdump provided to user via devcoredump
++ *              +------------------------------------------+
++ *              |         Crashdump Meta structure         |
++ *              | type: struct sahara_memory_dump_meta_v1  |
++ *              +------------------------------------------+
++ *              |             Crashdump Table              |
++ *              | type: array of struct                    |
++ *              |       sahara_dump_table_entry            |
++ *              |                                          |
++ *              |                                          |
++ *              +------------------------------------------+
++ *              |                Crashdump                 |
++ *              |                                          |
++ *              |                                          |
++ *              |                                          |
++ *              |                                          |
++ *              |                                          |
++ *              +------------------------------------------+
++ *
++ * First is the metadata header. Userspace can use the magic number to verify
++ * the content type, and then check the version for the rest of the format.
++ * New versions should keep the magic number location/value, and version
++ * location, but increment the version value.
++ *
++ * For v1, the metadata lists the size of the entire dump (header + table +
++ * dump) and the size of the table. Then the dump image table, which describes
++ * the contents of the dump. Finally all the images are listed in order, with
++ * no deadspace in between. Userspace can use the sizes listed in the image
++ * table to reconstruct the individual images.
++ */
++
++struct sahara_context {
++	/* tx[0] carries the control packets, tx[1..SAHARA_DATA_BUFS] the data */
++	struct sahara_packet		*tx[1 + SAHARA_DATA_BUFS];
++	/* transfers queued and taken by the device (the uplink callback) */
++	u64				tx_queued;
++	atomic64_t			tx_done;
++	wait_queue_head_t		tx_wait;
++	struct sahara_packet		*rx;
++	struct work_struct		fw_work;
++	struct work_struct		dump_work;
++	struct mhi_device		*mhi_dev;
++	const char * const		*image_table;
++	u32				table_size;
++	u32				active_image_id;
++	const struct firmware		*firmware;
++	/* the image is ours ("@/path", "=zero:N"), not from the firmware loader */
++	struct firmware			own_firmware;
++	bool				own;
++	u64				dump_table_address;
++	u64				dump_table_length;
++	size_t				rx_size;
++	size_t				rx_size_requested;
++	void				*mem_dump;
++	size_t				mem_dump_sz;
++	struct sahara_dump_table_entry	*dump_image;
++	u64				dump_image_offset;
++	void				*mem_dump_freespace;
++	u64				dump_images_left;
++	bool				is_mem_dump_mode;
++	/* the dump was offered with MEM_DEBUG (32-bit table and reads), not MEM_DEBUG64 */
++	bool				dump_narrow;
++};
++
++#define SAHARA_MAX_IMAGE_ID		256
++
++/* The SDX55 boot chain by Sahara image ID (sbl1 itself comes over BHI); EFS 16/17/20 from its partitions */
++static char *images = "4:apps.mbn,6:apps.mbn,8:qdsp6sw.mbn,12:qdsp6sw.mbn,"
++	"16:@/dev/disk/by-partlabel/mdm1m9kefs1,17:@/dev/disk/by-partlabel/mdm1m9kefs2,"
++	"20:@/dev/disk/by-partlabel/mdm1m9kefs3,23:aop.mbn,25:tz.mbn,26:=zero:512,29:acdb.mbn,33:hyp.mbn,"
++	"34:mdmddr.mbn,36:multi_image_qti.mbn,37:multi_image.mbn,38:xbl_cfg.elf,39:apps.mbn,40:apdp.mbn,"
++	"41:devcfg.mbn,42:sec.elf";
++module_param(images, charp, 0444);
++MODULE_PARM_DESC(images, "Sahara image map: id:file,... (files in fw_dir)");
++
++static char *fw_dir = "qcom/sdx55m";
++module_param(fw_dir, charp, 0444);
++MODULE_PARM_DESC(fw_dir, "firmware directory of the images");
++
++/* The image table from the "images" map: table[id] = "<fw_dir>/<file>" */
++static int sahara_build_table(struct device *dev, char ***table)
++{
++	char *map, *cur, *entry;
++	char **t;
++
++	t = devm_kcalloc(dev, SAHARA_MAX_IMAGE_ID, sizeof(*t), GFP_KERNEL);
++	if (!t)
++		return -ENOMEM;
++	map = kstrdup(images, GFP_KERNEL);
++	if (!map)
++		return -ENOMEM;
++	cur = map;
++	while ((entry = strsep(&cur, ","))) {
++		char *file = strchr(entry, ':');
++		unsigned int id;
++
++		if (!file)
++			continue;
++		*file++ = 0;
++		if (kstrtouint(strim(entry), 0, &id) || id >= SAHARA_MAX_IMAGE_ID || !*file) {
++			dev_warn(dev, "bad image map entry %s\n", entry);
++			continue;
++		}
++		file = strim(file);
++		/* "@/path" and "=zero:N" as they are, a file name below fw_dir */
++		t[id] = (*file == '@' || *file == '=') ? devm_kstrdup(dev, file, GFP_KERNEL)
++						     : devm_kasprintf(dev, GFP_KERNEL, "%s/%s", fw_dir, file);
++	}
++	kfree(map);
++	*table = t;
++	return 0;
++}
++
++/* "@/path": the whole file or block device; "=zero:N": N zero bytes */
++static int sahara_load_own(struct sahara_context *context, const char *spec)
++{
++	struct firmware *fw = &context->own_firmware;
++	size_t size;
++	void *data;
++
++	if (spec[0] == '=') {
++		unsigned int n;
++
++		if (strncmp(spec, "=zero:", 6) || kstrtouint(spec + 6, 0, &n) || !n || n > SZ_16M)
++			return -EINVAL;
++		data = vzalloc(n);
++		if (!data)
++			return -ENOMEM;
++		size = n;
++	} else {
++		struct file *file = filp_open(spec + 1, O_RDONLY | O_LARGEFILE, 0);
++		loff_t pos = 0;
++		ssize_t got;
++
++		if (IS_ERR(file))
++			return PTR_ERR(file);
++		size = i_size_read(file->f_mapping->host);
++		if (!size || size > SZ_64M) {
++			fput(file);
++			return -EFBIG;
++		}
++		data = vmalloc(size);
++		if (!data) {
++			fput(file);
++			return -ENOMEM;
++		}
++		got = kernel_read(file, data, size, &pos);
++		fput(file);
++		if (got != size) {
++			vfree(data);
++			return got < 0 ? got : -EIO;
++		}
++	}
++	fw->data = data;
++	fw->size = size;
++	context->firmware = fw;
++	context->own = true;
++	return 0;
++}
++
++static int sahara_find_image(struct sahara_context *context, u32 image_id)
++{
++	int ret;
++
++	if (image_id == context->active_image_id)
++		return 0;
++
++	if (context->active_image_id != SAHARA_IMAGE_ID_NONE) {
++		dev_err(&context->mhi_dev->dev, "image id %d is not valid as %d is active\n",
++			image_id, context->active_image_id);
++		return -EINVAL;
++	}
++
++	if (image_id >= context->table_size || !context->image_table[image_id]) {
++		dev_err(&context->mhi_dev->dev, "request for unknown image: %d\n", image_id);
++		return -EINVAL;
++	}
++
++	if (context->image_table[image_id][0] == '@' || context->image_table[image_id][0] == '=') {
++		ret = sahara_load_own(context, context->image_table[image_id]);
++	} else {
++		/*
++		 * This image might be optional. The device may continue without it.
++		 * Only the device knows.
++		 */
++		ret = firmware_request_nowarn(&context->firmware,
++					      context->image_table[image_id],
++					      &context->mhi_dev->dev);
++	}
++	if (ret) {
++		dev_warn(&context->mhi_dev->dev, "image %d (%s) not available: %d\n",
++			 image_id, context->image_table[image_id], ret);
++		return ret;
++	}
++
++	context->active_image_id = image_id;
++	dev_info(&context->mhi_dev->dev, "image %u: %s (%zu bytes)\n", image_id,
++		 context->image_table[image_id], context->firmware->size);
++
++	return 0;
++}
++
++static void sahara_release_image(struct sahara_context *context)
++{
++	if (context->active_image_id != SAHARA_IMAGE_ID_NONE) {
++		if (context->own)
++			vfree(context->own_firmware.data);
++		else
++			release_firmware(context->firmware);
++	}
++	context->own = false;
++	context->active_image_id = SAHARA_IMAGE_ID_NONE;
++}
++
++/* every uplink transfer, counted (the uplink callback counts the device taking them) */
++static int sahara_queue_tx(struct sahara_context *context, void *buf, size_t len)
++{
++	int ret = mhi_queue_buf(context->mhi_dev, DMA_TO_DEVICE, buf, len, MHI_EOT);
++
++	if (!ret)
++		context->tx_queued++;
++	return ret;
++}
++
++static void sahara_send_reset(struct sahara_context *context)
++{
++	int ret;
++
++	context->is_mem_dump_mode = false;
++
++	context->tx[0]->cmd = cpu_to_le32(SAHARA_RESET_CMD);
++	context->tx[0]->length = cpu_to_le32(SAHARA_RESET_LENGTH);
++
++	ret = sahara_queue_tx(context, context->tx[0], SAHARA_RESET_LENGTH);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to send reset response %d\n", ret);
++}
++
++static void sahara_hello(struct sahara_context *context)
++{
++	int ret;
++
++	dev_dbg(&context->mhi_dev->dev,
++		"HELLO cmd received. length:%d version:%d version_compat:%d max_length:%d mode:%d\n",
++		le32_to_cpu(context->rx->length),
++		le32_to_cpu(context->rx->hello.version),
++		le32_to_cpu(context->rx->hello.version_compat),
++		le32_to_cpu(context->rx->hello.max_length),
++		le32_to_cpu(context->rx->hello.mode));
++
++	if (le32_to_cpu(context->rx->length) != SAHARA_HELLO_LENGTH) {
++		dev_err(&context->mhi_dev->dev, "Malformed hello packet - length %d\n",
++			le32_to_cpu(context->rx->length));
++		return;
++	}
++	dev_info(&context->mhi_dev->dev, "hello: version %d (compatible %d), mode %d\n",
++		 le32_to_cpu(context->rx->hello.version), le32_to_cpu(context->rx->hello.version_compat),
++		 le32_to_cpu(context->rx->hello.mode));
++	if (le32_to_cpu(context->rx->hello.version) < SAHARA_VERSION) {
++		dev_err(&context->mhi_dev->dev, "Unsupported hello packet - version %d\n",
++			le32_to_cpu(context->rx->hello.version));
++		return;
++	}
++
++	if (le32_to_cpu(context->rx->hello.mode) != SAHARA_MODE_IMAGE_TX_PENDING &&
++	    le32_to_cpu(context->rx->hello.mode) != SAHARA_MODE_IMAGE_TX_COMPLETE &&
++	    le32_to_cpu(context->rx->hello.mode) != SAHARA_MODE_MEMORY_DEBUG &&
++	    le32_to_cpu(context->rx->hello.mode) != SAHARA_MODE_COMMAND) {
++		dev_err(&context->mhi_dev->dev, "Unsupported hello packet - mode %d\n",
++			le32_to_cpu(context->rx->hello.mode));
++		return;
++	}
++
++	context->tx[0]->cmd = cpu_to_le32(SAHARA_HELLO_RESP_CMD);
++	context->tx[0]->length = cpu_to_le32(SAHARA_HELLO_LENGTH);
++	context->tx[0]->hello_resp.version = cpu_to_le32(SAHARA_VERSION);
++	context->tx[0]->hello_resp.version_compat = cpu_to_le32(SAHARA_VERSION);
++	context->tx[0]->hello_resp.status = cpu_to_le32(SAHARA_SUCCESS);
++	context->tx[0]->hello_resp.mode = context->rx->hello_resp.mode;
++
++	ret = sahara_queue_tx(context, context->tx[0], SAHARA_HELLO_LENGTH);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to send hello response %d\n", ret);
++}
++
++static void sahara_send_data(struct sahara_context *context, u32 image_id, u64 offset, u64 length)
++{
++	u32 data_offset, data_len, pkt_data_len;
++	int ret;
++	int i;
++
++	if (offset > U32_MAX || length > U32_MAX) {
++		dev_err(&context->mhi_dev->dev, "read beyond 4 GiB: image %u offset %llu length %llu\n",
++			image_id, offset, length);
++		sahara_send_reset(context);
++		return;
++	}
++	data_offset = offset;
++	data_len = length;
++
++	ret = sahara_find_image(context, image_id);
++	if (ret) {
++		sahara_send_reset(context);
++		return;
++	}
++
++	/*
++	 * Image is released when the device is done with it via
++	 * SAHARA_END_OF_IMAGE_CMD. sahara_send_reset() will either cause the
++	 * device to retry the operation with a modification, or decide to be
++	 * done with the image and trigger SAHARA_END_OF_IMAGE_CMD.
++	 * release_image() is called from SAHARA_END_OF_IMAGE_CMD. processing
++	 * and is not needed here on error.
++	 */
++
++
++	if (data_offset >= context->firmware->size) {
++		dev_err(&context->mhi_dev->dev, "Malformed read_data packet - data offset %d exceeds file size %zu\n",
++			data_offset, context->firmware->size);
++		sahara_send_reset(context);
++		return;
++	}
++
++	if (size_add(data_offset, data_len) > context->firmware->size) {
++		dev_err(&context->mhi_dev->dev, "Malformed read_data packet - data offset %d and length %d exceeds file size %zu\n",
++			data_offset, data_len, context->firmware->size);
++		sahara_send_reset(context);
++		return;
++	}
++
++	/* the requested bytes in packets of one transfer each, a buffer reused once the device took it */
++	for (i = 0; data_len; i++) {
++		struct sahara_packet *buf = context->tx[1 + i % SAHARA_DATA_BUFS];
++		u64 need = context->tx_queued + 1 > SAHARA_DATA_BUFS ? context->tx_queued + 1 - SAHARA_DATA_BUFS : 0;
++
++		if (!wait_event_timeout(context->tx_wait, (u64)atomic64_read(&context->tx_done) >= need, 10 * HZ)) {
++			dev_err(&context->mhi_dev->dev, "image %u: the device stopped taking data\n", image_id);
++			return;
++		}
++		pkt_data_len = min(data_len, SAHARA_PACKET_MAX_SIZE);
++		memcpy(buf, &context->firmware->data[data_offset], pkt_data_len);
++		data_offset += pkt_data_len;
++		data_len -= pkt_data_len;
++		ret = sahara_queue_tx(context, buf, pkt_data_len);
++		if (ret) {
++			dev_err(&context->mhi_dev->dev, "Unable to send read_data response %d\n", ret);
++			return;
++		}
++	}
++}
++
++static void sahara_end_of_image(struct sahara_context *context)
++{
++	int ret;
++
++	dev_dbg(&context->mhi_dev->dev,
++		"END_OF_IMAGE cmd received. length:%d image:%d status:%d\n",
++		le32_to_cpu(context->rx->length),
++		le32_to_cpu(context->rx->end_of_image.image),
++		le32_to_cpu(context->rx->end_of_image.status));
++
++	if (le32_to_cpu(context->rx->length) != SAHARA_END_OF_IMAGE_LENGTH) {
++		dev_err(&context->mhi_dev->dev, "Malformed end_of_image packet - length %d\n",
++			le32_to_cpu(context->rx->length));
++		return;
++	}
++
++	if (context->active_image_id != SAHARA_IMAGE_ID_NONE &&
++	    le32_to_cpu(context->rx->end_of_image.image) != context->active_image_id) {
++		dev_err(&context->mhi_dev->dev, "Malformed end_of_image packet - image %d is not the active image\n",
++			le32_to_cpu(context->rx->end_of_image.image));
++		return;
++	}
++
++	sahara_release_image(context);
++
++	if (le32_to_cpu(context->rx->end_of_image.status))
++		return;
++
++	context->tx[0]->cmd = cpu_to_le32(SAHARA_DONE_CMD);
++	context->tx[0]->length = cpu_to_le32(SAHARA_DONE_LENGTH);
++
++	ret = sahara_queue_tx(context, context->tx[0], SAHARA_DONE_LENGTH);
++	if (ret)
++		dev_dbg(&context->mhi_dev->dev, "Unable to send done response %d\n", ret);
++}
++
++/* Ask the device for memory: the table, then the regions it lists, in the width the dump was offered in */
++static int sahara_mem_read(struct sahara_context *context, u64 address, u64 length)
++{
++	context->rx_size_requested = length;
++	if (context->dump_narrow) {
++		context->tx[0]->cmd = cpu_to_le32(SAHARA_MEM_READ_CMD);
++		context->tx[0]->length = cpu_to_le32(SAHARA_MEM_READ_LENGTH);
++		context->tx[0]->memory_read.memory_address = cpu_to_le32(address);
++		context->tx[0]->memory_read.memory_length = cpu_to_le32(length);
++		return sahara_queue_tx(context, context->tx[0], SAHARA_MEM_READ_LENGTH);
++	}
++	context->tx[0]->cmd = cpu_to_le32(SAHARA_MEM_READ64_CMD);
++	context->tx[0]->length = cpu_to_le32(SAHARA_MEM_READ64_LENGTH);
++	context->tx[0]->memory_read64.memory_address = cpu_to_le64(address);
++	context->tx[0]->memory_read64.memory_length = cpu_to_le64(length);
++	return sahara_queue_tx(context, context->tx[0], SAHARA_MEM_READ64_LENGTH);
++}
++
++static void sahara_memory_debug(struct sahara_context *context, bool narrow)
++{
++	size_t entry_size = narrow ? sizeof(struct sahara_debug_table_entry32) :
++				     sizeof(struct sahara_debug_table_entry64);
++	u32 length = le32_to_cpu(context->rx->length);
++	int ret;
++
++	if (length != (narrow ? SAHARA_MEM_DEBUG_LENGTH : SAHARA_MEM_DEBUG64_LENGTH)) {
++		dev_err(&context->mhi_dev->dev, "Malformed memory debug packet - length %d\n", length);
++		return;
++	}
++
++	context->dump_narrow = narrow;
++	if (narrow) {
++		context->dump_table_address = le32_to_cpu(context->rx->memory_debug.table_address);
++		context->dump_table_length = le32_to_cpu(context->rx->memory_debug.table_length);
++	} else {
++		context->dump_table_address = le64_to_cpu(context->rx->memory_debug64.table_address);
++		context->dump_table_length = le64_to_cpu(context->rx->memory_debug64.table_length);
++	}
++	dev_dbg(&context->mhi_dev->dev, "MEMORY DEBUG%s: table at %#llx, %#llx bytes\n", narrow ? "" : "64",
++		context->dump_table_address, context->dump_table_length);
++
++	if (context->dump_table_length % entry_size != 0 || !context->dump_table_length) {
++		dev_err(&context->mhi_dev->dev, "Malformed memory debug packet - table length %lld\n",
++			context->dump_table_length);
++		return;
++	}
++
++	/*
++	 * From this point, the protocol flips. We make memory_read requests to
++	 * the device, and the device responds with the raw data. If the device
++	 * has an error, it will send an End of Image command. First we need to
++	 * request the memory dump table so that we know where all the pieces
++	 * of the dump are that we can consume.
++	 */
++
++	context->is_mem_dump_mode = true;
++
++	/*
++	 * Assume that the table is smaller than our MTU so that we can read it
++	 * in one shot. The spec does not put an upper limit on the table, but
++	 * no known device will exceed this.
++	 */
++	if (context->dump_table_length > SAHARA_PACKET_MAX_SIZE) {
++		dev_err(&context->mhi_dev->dev, "Memory dump table length %lld exceeds supported size. Discarding dump\n",
++			context->dump_table_length);
++		sahara_send_reset(context);
++		return;
++	}
++
++	ret = sahara_mem_read(context, context->dump_table_address, context->dump_table_length);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to send read for dump table %d\n", ret);
++}
++
++static void sahara_read_data(struct sahara_context *context)
++{
++	if (le32_to_cpu(context->rx->length) != SAHARA_READ_DATA_LENGTH) {
++		dev_err(&context->mhi_dev->dev, "Malformed read_data packet - length %d\n",
++			le32_to_cpu(context->rx->length));
++		return;
++	}
++	sahara_send_data(context, le32_to_cpu(context->rx->read_data.image),
++			 le32_to_cpu(context->rx->read_data.offset),
++			 le32_to_cpu(context->rx->read_data.length));
++}
++
++static void sahara_read_data64(struct sahara_context *context)
++{
++	u64 image = le64_to_cpu(context->rx->read_data64.image);
++
++	if (le32_to_cpu(context->rx->length) != SAHARA_READ_DATA64_LENGTH || image > U32_MAX) {
++		dev_err(&context->mhi_dev->dev, "Malformed read_data64 packet - length %d\n",
++			le32_to_cpu(context->rx->length));
++		return;
++	}
++	sahara_send_data(context, image, le64_to_cpu(context->rx->read_data64.offset),
++			 le64_to_cpu(context->rx->read_data64.length));
++}
++
++/* The device is in command mode and ready: back to image transfer (it has more images to ask for) */
++static void sahara_command_ready(struct sahara_context *context)
++{
++	int ret;
++
++	context->tx[0]->cmd = cpu_to_le32(SAHARA_SWITCH_MODE_CMD);
++	context->tx[0]->length = cpu_to_le32(SAHARA_SWITCH_MODE_LENGTH);
++	context->tx[0]->switch_mode.mode = cpu_to_le32(SAHARA_MODE_IMAGE_TX_PENDING);
++	ret = sahara_queue_tx(context, context->tx[0], SAHARA_SWITCH_MODE_LENGTH);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to send switch mode %d\n", ret);
++}
++
++static void sahara_processing(struct work_struct *work)
++{
++	struct sahara_context *context = container_of(work, struct sahara_context, fw_work);
++	int ret;
++
++	switch (le32_to_cpu(context->rx->cmd)) {
++	case SAHARA_HELLO_CMD:
++		sahara_hello(context);
++		break;
++	case SAHARA_READ_DATA_CMD:
++		sahara_read_data(context);
++		break;
++	case SAHARA_READ_DATA64_CMD:
++		sahara_read_data64(context);
++		break;
++	case SAHARA_CMD_READY_CMD:
++		sahara_command_ready(context);
++		break;
++	case SAHARA_END_OF_IMAGE_CMD:
++		sahara_end_of_image(context);
++		break;
++	case SAHARA_DONE_RESP_CMD:
++		/* Intentional do nothing as we don't need to exit an app */
++		break;
++	case SAHARA_RESET_RESP_CMD:
++		/* Intentional do nothing as we don't need to exit an app */
++		break;
++	case SAHARA_MEM_DEBUG_CMD:
++		sahara_memory_debug(context, true);
++		break;
++	case SAHARA_MEM_DEBUG64_CMD:
++		sahara_memory_debug(context, false);
++		break;
++	default:
++		dev_err(&context->mhi_dev->dev, "Unknown command %d\n",
++			le32_to_cpu(context->rx->cmd));
++		break;
++	}
++
++	ret = mhi_queue_buf(context->mhi_dev, DMA_FROM_DEVICE, context->rx,
++			    SAHARA_PACKET_MAX_SIZE, MHI_EOT);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to requeue rx buf %d\n", ret);
++}
++
++static void sahara_parse_dump_table(struct sahara_context *context)
++{
++	struct sahara_dump_table_entry *image_out_table;
++	struct sahara_debug_table_entry32 *dev_table32;
++	struct sahara_debug_table_entry64 *dev_table;
++	struct sahara_memory_dump_meta_v1 *dump_meta;
++	struct sahara_dump_table_entry *entries;
++	u64 table_nents;
++	u64 dump_length;
++	int ret;
++	u64 i;
++
++	table_nents = context->dump_table_length / (context->dump_narrow ? sizeof(*dev_table32) :
++										sizeof(*dev_table));
++	context->dump_images_left = table_nents;
++	dump_length = 0;
++
++	/* Both layouts into one, before rx is reused */
++	entries = kcalloc(table_nents, sizeof(*entries), GFP_KERNEL);
++	if (!entries) {
++		sahara_send_reset(context);
++		return;
++	}
++	dev_table = (struct sahara_debug_table_entry64 *)(context->rx);
++	dev_table32 = (struct sahara_debug_table_entry32 *)(context->rx);
++	for (i = 0; i < table_nents; ++i) {
++		if (context->dump_narrow) {
++			entries[i].type = le32_to_cpu(dev_table32[i].type);
++			entries[i].address = le32_to_cpu(dev_table32[i].address);
++			entries[i].length = le32_to_cpu(dev_table32[i].length);
++			memcpy(entries[i].description, dev_table32[i].description, SAHARA_TABLE_ENTRY_STR_LEN);
++			memcpy(entries[i].filename, dev_table32[i].filename, SAHARA_TABLE_ENTRY_STR_LEN);
++		} else {
++			entries[i].type = le64_to_cpu(dev_table[i].type);
++			entries[i].address = le64_to_cpu(dev_table[i].address);
++			entries[i].length = le64_to_cpu(dev_table[i].length);
++			memcpy(entries[i].description, dev_table[i].description, SAHARA_TABLE_ENTRY_STR_LEN);
++			memcpy(entries[i].filename, dev_table[i].filename, SAHARA_TABLE_ENTRY_STR_LEN);
++		}
++		/* Do not trust the device, ensure the strings are terminated */
++		entries[i].description[SAHARA_TABLE_ENTRY_STR_LEN - 1] = 0;
++		entries[i].filename[SAHARA_TABLE_ENTRY_STR_LEN - 1] = 0;
++
++		dump_length = size_add(dump_length, entries[i].length);
++		if (dump_length == SIZE_MAX) {
++			/* Discard the dump */
++			kfree(entries);
++			sahara_send_reset(context);
++			return;
++		}
++
++		dev_info(&context->mhi_dev->dev, "dump region %llu: type %llu, %#llx bytes at %#llx, \"%s\" %s\n",
++			 i, entries[i].type, entries[i].length, entries[i].address, entries[i].description,
++			 entries[i].filename);
++	}
++
++	dump_length = size_add(dump_length, sizeof(*dump_meta));
++	dump_length = size_add(dump_length, size_mul(sizeof(*image_out_table), table_nents));
++	if (dump_length == SIZE_MAX) {
++		/* Discard the dump */
++		kfree(entries);
++		sahara_send_reset(context);
++		return;
++	}
++
++	context->mem_dump_sz = dump_length;
++	context->mem_dump = vzalloc(dump_length);
++	if (!context->mem_dump) {
++		/* Discard the dump */
++		kfree(entries);
++		sahara_send_reset(context);
++		return;
++	}
++
++	/* Populate the dump metadata and table for userspace */
++	dump_meta = context->mem_dump;
++	dump_meta->magic = SAHARA_DUMP_V1_MAGIC;
++	dump_meta->version = SAHARA_DUMP_V1_VER;
++	dump_meta->dump_size = dump_length;
++	/* the table as it is here (64-bit entries), whichever width the device sent */
++	dump_meta->table_size = size_mul(sizeof(*image_out_table), table_nents);
++
++	image_out_table = context->mem_dump + sizeof(*dump_meta);
++	memcpy(image_out_table, entries, size_mul(sizeof(*entries), table_nents));
++	kfree(entries);
++
++	context->mem_dump_freespace = &image_out_table[table_nents];
++
++	/* Done parsing the table, switch to image dump mode */
++	context->dump_table_length = 0;
++
++	/* Request the first chunk of the first image */
++	context->dump_image = &image_out_table[0];
++	dump_length = min(context->dump_image->length, SAHARA_READ_MAX_SIZE);
++	/* Avoid requesting EOI sized data so that we can identify errors */
++	if (dump_length == SAHARA_END_OF_IMAGE_LENGTH)
++		dump_length = SAHARA_END_OF_IMAGE_LENGTH / 2;
++
++	context->dump_image_offset = dump_length;
++
++	ret = sahara_mem_read(context, context->dump_image->address, dump_length);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to send read for dump content %d\n", ret);
++}
++
++static void sahara_parse_dump_image(struct sahara_context *context)
++{
++	u64 dump_length;
++	int ret;
++
++	memcpy(context->mem_dump_freespace, context->rx, context->rx_size);
++	context->mem_dump_freespace += context->rx_size;
++
++	if (context->dump_image_offset >= context->dump_image->length) {
++		/* Need to move to next image */
++		context->dump_image++;
++		context->dump_images_left--;
++		context->dump_image_offset = 0;
++
++		if (!context->dump_images_left) {
++			/* Dump done */
++			dev_info(&context->mhi_dev->dev, "dump done: %zu bytes as a device coredump\n",
++				 context->mem_dump_sz);
++			dev_coredumpv(context->mhi_dev->mhi_cntrl->cntrl_dev,
++				      context->mem_dump,
++				      context->mem_dump_sz,
++				      GFP_KERNEL);
++			context->mem_dump = NULL;
++			sahara_send_reset(context);
++			return;
++		}
++	}
++
++	/* Get next image chunk */
++	dump_length = context->dump_image->length - context->dump_image_offset;
++	dump_length = min(dump_length, SAHARA_READ_MAX_SIZE);
++	/* Avoid requesting EOI sized data so that we can identify errors */
++	if (dump_length == SAHARA_END_OF_IMAGE_LENGTH)
++		dump_length = SAHARA_END_OF_IMAGE_LENGTH / 2;
++
++	ret = sahara_mem_read(context, context->dump_image->address + context->dump_image_offset, dump_length);
++	context->dump_image_offset += dump_length;
++	if (ret)
++		dev_err(&context->mhi_dev->dev,
++			"Unable to send read for dump content %d\n", ret);
++}
++
++static void sahara_dump_processing(struct work_struct *work)
++{
++	struct sahara_context *context = container_of(work, struct sahara_context, dump_work);
++	int ret;
++
++	/*
++	 * We should get the expected raw data, but if the device has an error
++	 * it is supposed to send EOI with an error code.
++	 */
++	if (context->rx_size != context->rx_size_requested &&
++	    context->rx_size != SAHARA_END_OF_IMAGE_LENGTH) {
++		dev_err(&context->mhi_dev->dev,
++			"Unexpected response to read_data. Expected size: %#zx got: %#zx\n",
++			context->rx_size_requested,
++			context->rx_size);
++		goto error;
++	}
++
++	if (context->rx_size == SAHARA_END_OF_IMAGE_LENGTH &&
++	    le32_to_cpu(context->rx->cmd) == SAHARA_END_OF_IMAGE_CMD) {
++		dev_err(&context->mhi_dev->dev,
++			"Unexpected EOI response to read_data. Status: %d\n",
++			le32_to_cpu(context->rx->end_of_image.status));
++		goto error;
++	}
++
++	if (context->rx_size == SAHARA_END_OF_IMAGE_LENGTH &&
++	    le32_to_cpu(context->rx->cmd) != SAHARA_END_OF_IMAGE_CMD) {
++		dev_err(&context->mhi_dev->dev,
++			"Invalid EOI response to read_data. CMD: %d\n",
++			le32_to_cpu(context->rx->cmd));
++		goto error;
++	}
++
++	/*
++	 * Need to know if we received the dump table, or part of a dump image.
++	 * Since we get raw data, we cannot tell from the data itself. Instead,
++	 * we use the stored dump_table_length, which we zero after we read and
++	 * process the entire table.
++	 */
++	if (context->dump_table_length)
++		sahara_parse_dump_table(context);
++	else
++		sahara_parse_dump_image(context);
++
++	ret = mhi_queue_buf(context->mhi_dev, DMA_FROM_DEVICE, context->rx,
++			    SAHARA_PACKET_MAX_SIZE, MHI_EOT);
++	if (ret)
++		dev_err(&context->mhi_dev->dev, "Unable to requeue rx buf %d\n", ret);
++
++	return;
++
++error:
++	vfree(context->mem_dump);
++	context->mem_dump = NULL;
++	sahara_send_reset(context);
++}
++
++static int sahara_mhi_probe(struct mhi_device *mhi_dev, const struct mhi_device_id *id)
++{
++	unsigned int i;
++	struct sahara_context *context;
++	int ret;
++
++	context = devm_kzalloc(&mhi_dev->dev, sizeof(*context), GFP_KERNEL);
++	if (!context)
++		return -ENOMEM;
++
++	context->rx = devm_kzalloc(&mhi_dev->dev, SAHARA_PACKET_MAX_SIZE, GFP_KERNEL);
++	if (!context->rx)
++		return -ENOMEM;
++
++	/*
++	 * AIC100 defines SAHARA_TRANSFER_MAX_SIZE as the largest value it
++	 * will request for READ_DATA. This is larger than
++	 * SAHARA_PACKET_MAX_SIZE, and we need 9x SAHARA_PACKET_MAX_SIZE to
++	 * cover SAHARA_TRANSFER_MAX_SIZE. When the remote side issues a
++	 * READ_DATA, it requires a transfer of the exact size requested. We
++	 * can use MHI_CHAIN to link multiple buffers into a single transfer
++	 * but the remote side will not consume the buffers until it sees an
++	 * EOT, thus we need to allocate enough buffers to put in the tx fifo
++	 * to cover an entire READ_DATA request of the max size.
++	 */
++	context->mhi_dev = mhi_dev;
++	for (i = 0; i < ARRAY_SIZE(context->tx); i++) {
++		context->tx[i] = devm_kzalloc(&mhi_dev->dev, SAHARA_PACKET_MAX_SIZE, GFP_KERNEL);
++		if (!context->tx[i])
++			return -ENOMEM;
++	}
++	init_waitqueue_head(&context->tx_wait);
++
++	INIT_WORK(&context->fw_work, sahara_processing);
++	INIT_WORK(&context->dump_work, sahara_dump_processing);
++
++	{
++		char **table;
++
++		ret = sahara_build_table(&mhi_dev->dev, &table);
++		if (ret)
++			return ret;
++		context->image_table = (const char * const *)table;
++		context->table_size = SAHARA_MAX_IMAGE_ID;
++	}
++
++	context->active_image_id = SAHARA_IMAGE_ID_NONE;
++	dev_set_drvdata(&mhi_dev->dev, context);
++
++	ret = mhi_prepare_for_transfer(mhi_dev);
++	if (ret)
++		return ret;
++
++	ret = mhi_queue_buf(mhi_dev, DMA_FROM_DEVICE, context->rx, SAHARA_PACKET_MAX_SIZE, MHI_EOT);
++	if (ret) {
++		mhi_unprepare_from_transfer(mhi_dev);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void sahara_mhi_remove(struct mhi_device *mhi_dev)
++{
++	struct sahara_context *context = dev_get_drvdata(&mhi_dev->dev);
++
++	cancel_work_sync(&context->fw_work);
++	cancel_work_sync(&context->dump_work);
++	vfree(context->mem_dump);
++	sahara_release_image(context);
++	mhi_unprepare_from_transfer(mhi_dev);
++}
++
++static void sahara_mhi_ul_xfer_cb(struct mhi_device *mhi_dev, struct mhi_result *mhi_result)
++{
++	struct sahara_context *context = dev_get_drvdata(&mhi_dev->dev);
++
++	atomic64_inc(&context->tx_done);
++	wake_up(&context->tx_wait);
++}
++
++static void sahara_mhi_dl_xfer_cb(struct mhi_device *mhi_dev, struct mhi_result *mhi_result)
++{
++	struct sahara_context *context = dev_get_drvdata(&mhi_dev->dev);
++
++	if (!mhi_result->transaction_status) {
++		context->rx_size = mhi_result->bytes_xferd;
++		if (context->is_mem_dump_mode)
++			schedule_work(&context->dump_work);
++		else
++			schedule_work(&context->fw_work);
++	}
++
++}
++
++static const struct mhi_device_id sahara_mhi_match_table[] = {
++	{ .chan = "SAHARA", },
++	/* a flashless modem's NV (EFS) sync in mission mode: Sahara again, reads and memory debug (the write-back) */
++	{ .chan = "EFS", },
++	{},
++};
++MODULE_DEVICE_TABLE(mhi, sahara_mhi_match_table);
++
++static struct mhi_driver sahara_mhi_driver = {
++	.id_table = sahara_mhi_match_table,
++	.remove = sahara_mhi_remove,
++	.probe = sahara_mhi_probe,
++	.ul_xfer_cb = sahara_mhi_ul_xfer_cb,
++	.dl_xfer_cb = sahara_mhi_dl_xfer_cb,
++	.driver = {
++		.name = "mhi_sahara",
++	},
++};
++
++module_mhi_driver(sahara_mhi_driver);
++
++MODULE_DESCRIPTION("MHI Sahara image server (modems that boot from the host)");
++MODULE_LICENSE("GPL");

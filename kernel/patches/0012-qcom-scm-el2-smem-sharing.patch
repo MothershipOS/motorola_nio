@@ -1,0 +1,117 @@
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -1145,7 +1145,14 @@
+ 	};
+ 	struct qcom_scm_res res;
+ 
+-	ret = qcom_scm_call(dev, &desc, &res);
++	/*
++	 * mothershipOS: at EL2 Linux takes QHEE's place, and TZ only accepts MEM_ASSIGN from the hypervisor
++	 * as a fast (atomic) SMC (0xc2000c16, as QHEE issues it); the yielding form returns -EINVAL.
++	 */
++	if (is_kernel_in_hyp_mode())
++		ret = qcom_scm_call_atomic(dev, &desc, &res);
++	else
++		ret = qcom_scm_call(dev, &desc, &res);
+ 
+ 	return ret ? : res.result[0];
+ }
+@@ -2530,15 +2537,88 @@
+ }
+ static DEVICE_ATTR(nio_soc_hw_version, 0400, nio_soc_hw_version_show, NULL);
+ 
++static void qcom_scm_el2_mem_assign(struct qcom_scm *scm);
++
++/* mothershipOS: replay QHEE's boot-time memory sharing on demand (write 1), see qcom_scm_el2_mem_assign() */
++static ssize_t nio_el2_mem_assign_store(struct device *dev, struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	if (!sysfs_streq(buf, "1"))
++		return -EINVAL;
++	qcom_scm_el2_mem_assign(dev_get_drvdata(dev) ?: __scm);
++	return count;
++}
++static DEVICE_ATTR(nio_el2_mem_assign, 0200, NULL, nio_el2_mem_assign_store);
++
+ static struct attribute *nio_scm_attrs[] = {
+ 	&dev_attr_nio_secure_state.attr,
+ 	&dev_attr_nio_soc_hw_version.attr,
++	&dev_attr_nio_el2_mem_assign.attr,
+ 	NULL,
+ };
+ 
+ static const struct attribute_group nio_scm_group = {
+ 	.attrs = nio_scm_attrs,
+ };
++
++/*
++ * mothershipOS: at EL2 there is no Qualcomm hypervisor (QHEE). At boot QHEE shares memory that the
++ * remote processors need with them through TZ MEM_ASSIGN: the SMEM table of contents and partitions
++ * (SMP2P / GLINK FIFOs), cmd-db and TZ<->subsystem channel pages. Without that a DSP authenticates and
++ * leaves reset but then hangs silently. Replay the same assignments, listed in the scm node:
++ *
++ *	el2-mem-assign {
++ *		#address-cells = <2>; #size-cells = <2>;
++ *		smem-toc { reg = <0 0x80aff000 0 0x1000>; qcom,vmid-perms = <3 4>, <6 4>, ...; };
++ *	};
++ *
++ * Every region starts owned by HLOS (VMID 3) alone. Only done when Linux runs at EL2.
++ */
++static bool qcom_scm_el2_mem_assigned;
++
++static void qcom_scm_el2_mem_assign(struct qcom_scm *scm)
++{
++	struct device_node *list, *np;
++	struct qcom_scm_vmperm perms[16];
++	u32 pairs[32];
++	u64 src, addr, size;
++	int n, i, ret, ok = 0, failed = 0;
++
++	if (!is_kernel_in_hyp_mode() || qcom_scm_el2_mem_assigned)
++		return;
++	qcom_scm_el2_mem_assigned = true;
++	list = of_get_child_by_name(scm->dev->of_node, "el2-mem-assign");
++	if (!list)
++		return;
++	for_each_available_child_of_node(list, np) {
++		if (of_property_read_reg(np, 0, &addr, &size)) {
++			dev_err(scm->dev, "el2-mem-assign %pOFn: bad reg\n", np);
++			failed++;
++			continue;
++		}
++		n = of_property_count_u32_elems(np, "qcom,vmid-perms");
++		if (n <= 0 || n % 2 || n > ARRAY_SIZE(pairs) ||
++		    of_property_read_u32_array(np, "qcom,vmid-perms", pairs, n)) {
++			dev_err(scm->dev, "el2-mem-assign %pOFn: bad qcom,vmid-perms\n", np);
++			failed++;
++			continue;
++		}
++		for (i = 0; i < n / 2; i++) {
++			perms[i].vmid = pairs[2 * i];
++			perms[i].perm = pairs[2 * i + 1];
++		}
++		src = BIT(QCOM_SCM_VMID_HLOS);
++		ret = qcom_scm_assign_mem(addr, size, &src, perms, n / 2);
++		if (ret) {
++			dev_err(scm->dev, "el2-mem-assign %pOFn %#llx+%#llx: %d\n", np, addr, size, ret);
++			failed++;
++		} else {
++			ok++;
++		}
++	}
++	of_node_put(list);
++	dev_info(scm->dev, "EL2: assigned %d memory regions to remote VMs (%d failed)\n", ok, failed);
++}
+ 
+ static int qcom_scm_probe(struct platform_device *pdev)
+ {
+@@ -2677,6 +2757,9 @@
+ 	/* Initialize the QTEE object interface. */
+ 	qcom_scm_qtee_init(scm);
+ 
++	if (of_property_read_bool(scm->dev->of_node, "mothership,el2-mem-assign-at-boot"))
++		qcom_scm_el2_mem_assign(scm);
++
+ 	if (of_machine_is_compatible("motorola,nio") ||
+ 	    of_machine_is_compatible("qcom,kona-nio")) {
+ 		ret = devm_device_add_group(scm->dev, &nio_scm_group);

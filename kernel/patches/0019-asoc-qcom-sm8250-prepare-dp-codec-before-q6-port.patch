@@ -1,0 +1,35 @@
+From: mothershipOS
+Subject: [PATCH] ASoC: qcom: sm8250: prepare the DisplayPort codec before the Q6 AFE port
+
+q6afe-dai starts the DSP's DISPLAY_PORT_RX port in its prepare, and the DSP only accepts that once the DP
+controller's audio engine runs. The msm DP driver turns the engine on in its codec prepare (drm_hdmi_audio_helper),
+which ASoC calls after the CPU DAI's: the port start timed out (-110) and left the port unusable (DSP error 9)
+until the card was reloaded. The link prepare runs first: prepare the codec DAIs there for DISPLAY_PORT_RX.
+
+---
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -150,6 +150,23 @@
+ 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+ 	struct sdw_stream_runtime *sruntime = data->sruntime[cpu_dai->id];
+ 
++	/*
++	 * DisplayPort: the DSP's AFE port only starts (q6afe-dai prepare) once the DP controller's audio engine runs,
++	 * and the DP driver turns that on in its codec prepare, which ASoC calls after the CPU DAI's: the port start
++	 * times out (-110). Prepare the codec first; its own prepare later reprograms the same, idle, engine.
++	 */
++	if (cpu_dai->id == DISPLAY_PORT_RX) {
++		struct snd_soc_dai *codec_dai;
++		int i, ret;
++
++		for_each_rtd_codec_dais(rtd, i, codec_dai) {
++			ret = snd_soc_dai_prepare(codec_dai, substream);
++			if (ret < 0)
++				return ret;
++		}
++		return 0;
++	}
++
+ 	return qcom_snd_sdw_prepare(substream, sruntime,
+ 				    &data->stream_prepared[cpu_dai->id]);
+ }

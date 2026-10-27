@@ -1,0 +1,159 @@
+mothershipOS: forward PM8150B hw Type-C CC orientation to the QMP combo PHY orientation switch (no TCPM).
+
+--- a/drivers/usb/typec/Kconfig
++++ b/drivers/usb/typec/Kconfig
+@@ -77,6 +77,14 @@
+ 	  If you choose to build this driver as a dynamically linked module, the
+ 	  module will be called rt1719.ko
+ 
++config TYPEC_QCOM_PMIC_CC_ORIENTATION
++	tristate "Qualcomm PMIC Type-C CC orientation reporter"
++	depends on SPMI && OF
++	help
++	  Reads the plug orientation detected by the PM8150B hardware Type-C
++	  state machine and forwards it to a typec orientation switch such as
++	  the QMP USB3/DP combo PHY, without taking over CC handling (no TCPM).
++
+ config TYPEC_HD3SS3220
+ 	tristate "TI HD3SS3220 Type-C DRP Port controller driver"
+ 	depends on I2C
+--- a/drivers/usb/typec/Makefile
++++ b/drivers/usb/typec/Makefile
+@@ -7,6 +7,7 @@
+ obj-$(CONFIG_TYPEC_UCSI)	+= ucsi/
+ obj-$(CONFIG_TYPEC_TPS6598X)	+= tipd/
+ obj-$(CONFIG_TYPEC_ANX7411)	+= anx7411.o
++obj-$(CONFIG_TYPEC_QCOM_PMIC_CC_ORIENTATION)	+= qcom-pmic-cc-orientation.o
+ obj-$(CONFIG_TYPEC_HD3SS3220)	+= hd3ss3220.o
+ obj-$(CONFIG_TYPEC_STUSB160X) 	+= stusb160x.o
+ obj-$(CONFIG_TYPEC_RT1719)	+= rt1719.o
+--- /dev/null
++++ b/drivers/usb/typec/qcom-pmic-cc-orientation.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Qualcomm PM8150B Type-C CC orientation -> typec orientation switch (mothershipOS / Motorola nio).
++ *
++ * Leaves the PMIC's hardware Type-C state machine in charge of CC (no TCPM, no PD) and only reports
++ * the detected plug orientation to the connected orientation switch, e.g. the QMP USB3/DP combo PHY,
++ * so SuperSpeed trains in both plug directions.
++ */
++
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/usb/typec_mux.h>
++
++#define TYPEC_MISC_STATUS_REG	0x0b
++#define  CC_ATTACHED		BIT(0)
++#define  CC_ORIENTATION		BIT(1)
++
++struct pmic_cc_orient {
++	struct device *dev;
++	struct regmap *map;
++	u32 base;
++	struct typec_switch *sw;
++	struct mutex lock;
++	enum typec_orientation cur;
++};
++
++static void pmic_cc_orient_update(struct pmic_cc_orient *o)
++{
++	enum typec_orientation orient;
++	unsigned int misc;
++	int ret;
++
++	mutex_lock(&o->lock);
++	if (regmap_read(o->map, o->base + TYPEC_MISC_STATUS_REG, &misc))
++		goto out;
++	if (!(misc & CC_ATTACHED))
++		goto out;	/* keep the last orientation while detached; the PHY ignores NONE */
++	orient = (misc & CC_ORIENTATION) ? TYPEC_ORIENTATION_REVERSE : TYPEC_ORIENTATION_NORMAL;
++	if (orient == o->cur)
++		goto out;
++	ret = typec_switch_set(o->sw, orient);
++	if (ret) {
++		dev_err(o->dev, "orientation switch: %d\n", ret);
++		goto out;
++	}
++	o->cur = orient;
++	dev_info(o->dev, "cc orientation %s\n", orient == TYPEC_ORIENTATION_REVERSE ? "reverse" : "normal");
++out:
++	mutex_unlock(&o->lock);
++}
++
++static irqreturn_t pmic_cc_orient_irq(int irq, void *data)
++{
++	pmic_cc_orient_update(data);
++	return IRQ_HANDLED;
++}
++
++static void pmic_cc_orient_put_sw(void *sw)
++{
++	typec_switch_put(sw);
++}
++
++static int pmic_cc_orient_probe(struct platform_device *pdev)
++{
++	static const char * const irqs[] = { "cc-state-change", "attach-detach" };
++	struct device *dev = &pdev->dev;
++	struct pmic_cc_orient *o;
++	int i, irq, ret;
++
++	o = devm_kzalloc(dev, sizeof(*o), GFP_KERNEL);
++	if (!o)
++		return -ENOMEM;
++	o->dev = dev;
++	o->cur = TYPEC_ORIENTATION_NONE;
++	mutex_init(&o->lock);
++
++	o->map = dev_get_regmap(dev->parent, NULL);
++	if (!o->map)
++		return -ENODEV;
++	ret = of_property_read_u32(dev->of_node, "reg", &o->base);
++	if (ret)
++		return ret;
++
++	o->sw = fwnode_typec_switch_get(dev_fwnode(dev));
++	if (IS_ERR(o->sw))
++		return dev_err_probe(dev, PTR_ERR(o->sw), "no orientation switch\n");
++	if (!o->sw)
++		return dev_err_probe(dev, -ENODEV, "no orientation switch in graph\n");
++	ret = devm_add_action_or_reset(dev, pmic_cc_orient_put_sw, o->sw);
++	if (ret)
++		return ret;
++
++	pmic_cc_orient_update(o);
++
++	for (i = 0; i < ARRAY_SIZE(irqs); i++) {
++		irq = platform_get_irq_byname(pdev, irqs[i]);
++		if (irq < 0)
++			return irq;
++		ret = devm_request_threaded_irq(dev, irq, NULL, pmic_cc_orient_irq, IRQF_ONESHOT,
++						irqs[i], o);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static const struct of_device_id pmic_cc_orient_of_match[] = {
++	{ .compatible = "qcom,pm8150b-cc-orientation" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, pmic_cc_orient_of_match);
++
++static struct platform_driver pmic_cc_orient_driver = {
++	.driver = {
++		.name = "qcom-pmic-cc-orientation",
++		.of_match_table = pmic_cc_orient_of_match,
++	},
++	.probe = pmic_cc_orient_probe,
++};
++module_platform_driver(pmic_cc_orient_driver);
++
++MODULE_DESCRIPTION("Qualcomm PMIC Type-C CC orientation reporter");
++MODULE_LICENSE("GPL");

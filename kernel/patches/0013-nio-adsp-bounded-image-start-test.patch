@@ -1,0 +1,239 @@
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -7,6 +7,8 @@
+  * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/arm-smccc.h>
++#include <linux/dma-mapping.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+@@ -31,6 +33,25 @@
+ #include "qcom_q6v5.h"
+ #include "remoteproc_internal.h"
+ 
++#include <asm/virt.h>
++
++/* Diagnostic only: disabled unless root explicitly opts in at runtime. */
++static bool nio_el2_cmdb_early_bridge;
++module_param(nio_el2_cmdb_early_bridge, bool, 0600);
++MODULE_PARM_DESC(nio_el2_cmdb_early_bridge, "Consume early HLOS-only RO bridge for bounded CMD-DB test");
++
++static bool nio_el2_cmdb_start_test;
++module_param(nio_el2_cmdb_start_test, bool, 0600);
++MODULE_PARM_DESC(nio_el2_cmdb_start_test, "Explicitly approved CMD-DB RO sharing during bounded ADSP test only");
++
++static bool nio_el2_image_hyp_caller;
++module_param(nio_el2_image_hyp_caller, bool, 0600);
++MODULE_PARM_DESC(nio_el2_image_hyp_caller, "Use private VMID4-registered descriptors for bounded ADSP test");
++
++static bool nio_el2_image_start_test;
++module_param(nio_el2_image_start_test, bool, 0600);
++MODULE_PARM_DESC(nio_el2_image_start_test, "Bounded nio ADSP image-sharing startup test; always shutdown and restore");
++
+ #define QCOM_PAS_DECRYPT_SHUTDOWN_DELAY_MS	100
+ 
+ #define MAX_ASSIGN_COUNT 3
+@@ -64,6 +85,7 @@
+ struct qcom_pas {
+ 	struct device *dev;
+ 	struct rproc *rproc;
++	bool nio_image_retained;
+ 
+ 	struct qcom_q6v5 q6v5;
+ 
+@@ -223,6 +245,9 @@
+ 	struct qcom_pas *pas = rproc->priv;
+ 	int ret;
+ 
++	if (pas->nio_image_retained)
++		return -EBUSY; /* No image writes after uncertain shutdown/restoration. */
++
+ 	/* Store firmware handle to be used in qcom_pas_start() */
+ 	pas->firmware = fw;
+ 
+@@ -262,6 +287,170 @@
+ 	return ret;
+ }
+ 
++/* Diagnostic HYP-caller assignment. Only private descriptor storage is
++ * additionally shared with VMID4; the target remains the approved ADSP image.
++ */
++static int nio_pas_hyp_assign(struct qcom_pas *pas, phys_addr_t base, size_t bytes,
++			      u64 *owners,
++			      struct qcom_scm_vmperm *dest, int count)
++{
++	struct qcom_scm_vmperm descriptor_shared[] = { {3, 6}, {4, 6} };
++	struct qcom_scm_vmperm hlos = {3, 7};
++	struct arm_smccc_res result;
++	__le32 *src, *dst;
++	__le64 *region, *extra;
++	dma_addr_t pa;
++	void *buf;
++	u64 descriptor_owners = BIT(3), handle = 0, new_owners = 0;
++	int ret, clean, i, n = 0;
++	bool bridge = false, unsafe = false;
++
++	if (!((base == 0x8a100000 && bytes == 0x1d00000) ||
++	      (base == 0x80860000 && bytes == 0x20000)))
++		return -EINVAL;
++	if (*owners & ~(BIT_ULL(3) | BIT_ULL(6)))
++		return -EINVAL;
++	buf = dma_alloc_coherent(pas->dev, PAGE_SIZE, &pa, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	memset(buf, 0, PAGE_SIZE);
++	src = buf; region = buf + 64; dst = buf + 128; extra = buf + 192;
++	for (i = 0; i < 64; i++)
++		if (*owners & BIT_ULL(i))
++			src[n++] = cpu_to_le32(i);
++	/* The bounded test only uses owners 3 and 6 and up to two destinations. */
++	if (!n || n > 2 || count < 1 || count > 2) { ret = -EINVAL; goto out; }
++	region[0] = cpu_to_le64(base);
++	region[1] = cpu_to_le64(bytes);
++	for (i = 0; i < count; i++) {
++		dst[6*i] = cpu_to_le32(dest[i].vmid);
++		dst[6*i+1] = cpu_to_le32(dest[i].perm);
++		new_owners |= BIT_ULL(dest[i].vmid);
++	}
++	extra[0] = cpu_to_le64(4*n);
++	extra[1] = cpu_to_le64(pa + 128);
++	extra[2] = cpu_to_le64(24*count);
++
++	ret = qcom_scm_assign_mem(pa, PAGE_SIZE, &descriptor_owners,
++				 descriptor_shared, 2);
++	if (ret) goto out;
++	ret = qcom_scm_shm_bridge_create(pa | 6, pa | 6,
++					PAGE_SIZE | BIT(9), 4, &handle);
++	if (ret) goto restore_descriptor;
++	bridge = true;
++	wmb();
++	arm_smccc_smc(0xc2000c16, 0x1117, pa+64, 16, pa, pa+192, 0, 0, &result);
++	dev_info(pas->dev, "nio HYP assign %pa+%#zx: a0=%#lx a1=%#lx\n", &base, bytes, result.a0, result.a1);
++	ret = result.a0 || result.a1 ? -EIO : 0;
++	if (!ret) *owners = new_owners;
++restore_descriptor:
++	if (bridge) {
++		clean = qcom_scm_shm_bridge_delete(handle);
++		dev_info(pas->dev, "nio HYP descriptor bridge delete=%d\n", clean);
++		if (clean) unsafe = true;
++	}
++	clean = qcom_scm_assign_mem(pa, PAGE_SIZE, &descriptor_owners, &hlos, 1);
++	dev_info(pas->dev, "nio HYP descriptor restore=%d\n", clean);
++	if (clean) unsafe = true;
++out:
++	if (!unsafe)
++		dma_free_coherent(pas->dev, PAGE_SIZE, buf, pa);
++	else
++		dev_err(pas->dev, "nio HYP descriptor page retained; reboot to clear private allocation\n");
++	/* Never mask target success: the caller must still shutdown/restore it. */
++	return ret;
++}
++
++/* One bounded experiment, not a production ownership policy. Called with
++ * remoteproc serialization, after image loading and before authentication.
++ */
++static int nio_pas_image_start_test(struct qcom_pas *pas)
++{
++	struct qcom_scm_vmperm shared[] = {{3, 6}, {6, 6}};
++	struct qcom_scm_vmperm restored = {3, 7};
++	struct qcom_scm_vmperm readers[] = {{3, 4}, {6, 4}}, cmd_hlos = {3, 4};
++	u64 owners = BIT(3), cmd_owners = BIT(3), cmd_handle = 0;
++	struct device_node *node;
++	struct resource cmd;
++	bool cmd_shared = false, cmd_bridge = false;
++	int ret, shutdown, restore, cmd_restore;
++
++	if (!is_kernel_in_hyp_mode() || pas->pas_id != 1 ||
++	    !of_device_is_compatible(pas->dev->of_node, "qcom,sm8250-adsp-pas") ||
++	    pas->mem_phys != 0x8a100000 || pas->mem_size != 0x1d00000)
++		return -EINVAL;
++
++	/* Separate permission scope, root-only and disabled by default. */
++	if (nio_el2_cmdb_start_test) {
++		if (!nio_el2_image_hyp_caller) return -EINVAL;
++		node = of_find_compatible_node(NULL, NULL, "qcom,cmd-db");
++		if (!node) return -ENODEV;
++		ret = of_address_to_resource(node, 0, &cmd);
++		of_node_put(node);
++		if (ret || cmd.start != 0x80860000 || resource_size(&cmd) != 0x20000)
++			return -EINVAL;
++		/* Register target RO for HLOS before changing its NS access policy. */
++		if (nio_el2_cmdb_early_bridge)
++			ret = qcom_scm_nio_cmdb_test_take_bridge(&cmd_handle);
++		else
++			ret = qcom_scm_shm_bridge_create(cmd.start | 4, cmd.start | 4,
++							resource_size(&cmd) | BIT(9), 3, &cmd_handle);
++		dev_info(pas->dev, "nio image-start-test: CMD-DB RO bridge=%d\n", ret);
++		if (ret) return ret < 0 ? ret : -EIO;
++		cmd_bridge = true;
++		ret = nio_pas_hyp_assign(pas, cmd.start, resource_size(&cmd),
++					&cmd_owners, readers, 2);
++		dev_info(pas->dev, "nio image-start-test: CMD-DB RO share=%d owners=%#llx\n", ret, cmd_owners);
++		if (ret) goto restore_cmd;
++		cmd_shared = true;
++	}
++
++	if (nio_el2_image_hyp_caller)
++		ret = nio_pas_hyp_assign(pas, pas->mem_phys, pas->mem_size, &owners, shared, 2);
++	else
++		ret = qcom_scm_assign_mem(pas->mem_phys, pas->mem_size, &owners, shared, 2);
++	dev_info(pas->dev, "nio image-start-test: share=%d owners=%#llx\n", ret, owners);
++	if (ret) goto restore_cmd;
++	pas->nio_image_retained = true;
++
++	ret = qcom_scm_pas_auth_and_reset(pas->pas_id);
++	dev_info(pas->dev, "nio image-start-test: auth=%d\n", ret);
++	if (!ret) {
++		ret = qcom_q6v5_wait_for_start(&pas->q6v5, msecs_to_jiffies(5000));
++		dev_info(pas->dev, "nio image-start-test: ready=%d\n", ret);
++	}
++	shutdown = qcom_scm_pas_shutdown(pas->pas_id);
++	dev_info(pas->dev, "nio image-start-test: shutdown=%d\n", shutdown);
++	if (shutdown) {
++		dev_err(pas->dev, "nio image-start-test: kept shared; reboot required\n");
++		return shutdown;
++	}
++	if (nio_el2_image_hyp_caller)
++		restore = nio_pas_hyp_assign(pas, pas->mem_phys, pas->mem_size, &owners, &restored, 1);
++	else
++		restore = qcom_scm_assign_mem(pas->mem_phys, pas->mem_size, &owners, &restored, 1);
++	dev_info(pas->dev, "nio image-start-test: restore=%d owners=%#llx\n", restore, owners);
++	if (restore) ret = restore;
++	pas->nio_image_retained = !!restore;
++restore_cmd:
++	/* Shutdown succeeded or reset was never released. HLOS continues reading CMD-DB. */
++	if (cmd_shared) {
++		cmd_restore = nio_pas_hyp_assign(pas, cmd.start, resource_size(&cmd),
++						&cmd_owners, &cmd_hlos, 1);
++		dev_info(pas->dev, "nio image-start-test: CMD-DB HLOS RO restore=%d owners=%#llx\n", cmd_restore, cmd_owners);
++		if (cmd_restore) { pas->nio_image_retained = true; ret = cmd_restore; }
++	}
++	if (cmd_bridge) {
++		cmd_restore = qcom_scm_shm_bridge_delete(cmd_handle);
++		dev_info(pas->dev, "nio image-start-test: CMD-DB bridge delete=%d\n", cmd_restore);
++		if (cmd_restore) { pas->nio_image_retained = true; ret = cmd_restore; }
++	}
++	if (pas->nio_image_retained)
++		dev_err(pas->dev, "nio image-start-test: kept shared; reboot required\n");
++	/* Even a ready success is stopped; no persistent DSP ownership policy. */
++	return ret ? ret : -EAGAIN;
++}
++
+ static int qcom_pas_start(struct rproc *rproc)
+ {
+ 	struct qcom_pas *pas = rproc->priv;
+@@ -316,6 +505,12 @@
+ 		goto release_pas_metadata;
+ 
+ 	qcom_pil_info_store(pas->info_name, pas->mem_phys, pas->mem_size);
++
++	if (nio_el2_image_start_test && pas->pas_id == 1) {
++		nio_el2_image_start_test = false; /* One attempt per explicit opt-in. */
++		ret = nio_pas_image_start_test(pas);
++		goto release_pas_metadata;
++	}
+ 
+ 	ret = qcom_scm_pas_auth_and_reset(pas->pas_id);
+ 	if (ret) {

@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0
+/* mothershipOS: Venus video codec at EL2 via the driver's no-TrustZone boot (mainline EL2-video pattern,
+ * cf. sc7180-el2.dtso / sc7280-chrome-common.dtsi). A `video-firmware` subnode makes the venus driver set
+ * use_tz=false: it loads the firmware itself and maps it for the firmware's own SMMU stream, so TZ's
+ * secure-SID setup (the 0x0aac2000 block, not writable from our EL2 — see docs/video.md) is never needed.
+ *
+ * firmware-name: the UPSTREAM non-secure iris2 blob (linux-firmware qcom/vpu-1.0 = VIDEO.VPU.1.0-00119),
+ *   installed as venus-vpu.mbn. The Motorola stock secure venus.mdt hard-resets the SoC on core release.
+ * video-firmware SMMU stream: the firmware fetches with SIDs {0x2102, 0x2502} (measured via the apps-SMMU
+ *   global fault syndrome on core release); SID 0x2102 + mask 0x400 covers both, and is disjoint from the
+ *   codec data streams the main node claims (0x2100 + mask 0x400 = {0x2100, 0x2500}).
+ * apps_smmu phandle = 0x31.
+ */
+/dts-v1/;
+/plugin/;
+
+&{/soc@0/video-codec@aa00000} {
+	firmware-name = "qcom/sm8250/nio/venus-vpu.mbn";
+	status = "okay";
+
+	video-firmware {
+		iommus = <0x31 0x2102 0x400>;
+	};
+};

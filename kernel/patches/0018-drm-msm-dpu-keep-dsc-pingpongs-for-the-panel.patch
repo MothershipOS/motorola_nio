@@ -1,0 +1,52 @@
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -361,7 +361,14 @@
+ 	int lm_idx[MAX_BLOCKS];
+ 	int pp_idx[MAX_BLOCKS];
+ 	int dspp_idx[MAX_BLOCKS] = {0};
+-	int i, lm_count = 0;
++	int i, k, lm_count = 0;
++	/*
++	 * mothershipOS: a display without DSC (DisplayPort) takes mixers from the top. The low mixers' pingpongs are
++	 * the ones the DSC blocks are wired to (DPU < 7: DSC n <-> PINGPONG n); _dpu_rm_dsc_alloc only checks
++	 * parity, so a DSC panel that got pingpong 2/3 because DP had taken 0/1 was accepted and showed noise.
++	 */
++	bool top_down = !topology->num_dsc;
++	int n = ARRAY_SIZE(rm->mixer_blks);
+ 
+ 	if (!topology->num_lm) {
+ 		DPU_ERROR("invalid number of lm: %d\n", topology->num_lm);
+@@ -369,8 +376,8 @@
+ 	}
+ 
+ 	/* Find a primary mixer */
+-	for (i = 0; i < ARRAY_SIZE(rm->mixer_blks) &&
+-			lm_count < topology->num_lm; i++) {
++	for (k = 0; k < n && lm_count < topology->num_lm; k++) {
++		i = top_down ? n - 1 - k : k;
+ 		if (!rm->mixer_blks[i])
+ 			continue;
+ 
+@@ -390,7 +397,7 @@
+ 			int j = _dpu_rm_get_lm_peer(rm, i);
+ 
+ 			/* ignore the peer if there is an error or if the peer was already processed */
+-			if (j < 0 || j < i)
++			if (j < 0 || (top_down ? j > i : j < i))
+ 				continue;
+ 
+ 			if (!rm->mixer_blks[j])
+@@ -413,6 +420,13 @@
+ 		return -ENAVAIL;
+ 	}
+ 
++	/* mothershipOS: a pair found top-down keeps the lower mixer first (left half), as bottom-up */
++	if (lm_count == 2 && lm_idx[1] < lm_idx[0]) {
++		swap(lm_idx[0], lm_idx[1]);
++		swap(pp_idx[0], pp_idx[1]);
++		swap(dspp_idx[0], dspp_idx[1]);
++	}
++
+ 	for (i = 0; i < lm_count; i++) {
+ 		global_state->mixer_to_crtc_id[lm_idx[i]] = crtc_id;
+ 		global_state->pingpong_to_crtc_id[pp_idx[i]] = crtc_id;

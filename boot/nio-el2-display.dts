@@ -1,0 +1,1130 @@
+// mothershipOS A4: internal panel (Tianma NT36672C 1080x2520 DSC, DSI0) + PM8150L WLED backlight.
+// Layered on nio-el2.dts by path references; values from the stock nio DT
+// (qcom,mdss_dsi_mot_tm_nt36672c_670_1080x2520_dsc_vid, qcom,wled@d800, dsi/phy supplies).
+/include/ "nio-el2.dts"
+
+/ {
+	chosen {
+		framebuffer@9c000000 {
+			status = "disabled";	/* no ABL splash at EL2; msm fbdev replaces it */
+		};
+	};
+};
+
+&{/soc@0/rsc@18200000/regulators-0} {
+	vreg_l9a_1p2: ldo9 {		/* DSI ctrl vdda (stock vdda-1p2 = pm8150_l9) */
+		regulator-name = "vreg_l9a_1p2";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-initial-mode = <3>;
+	};
+};
+
+&{/soc@0/rsc@18200000/regulators-0} {
+	vreg_l18a_0p92: ldo18 {		/* USB3 QMP PHY vdda-pll (stock ssphy vdd = pm8150_l18 912 mV) */
+		regulator-name = "vreg_l18a_0p92";
+		regulator-min-microvolt = <912000>;
+		regulator-max-microvolt = <912000>;
+		regulator-initial-mode = <3>;
+	};
+};
+
+&{/soc@0/rsc@18200000/regulators-1} {
+	vreg_l1c_1p8: ldo1 {		/* panel vddio (stock vddio_disp = pm8150a_l1) */
+		regulator-name = "vreg_l1c_1p8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-initial-mode = <3>;
+	};
+};
+
+&{/soc@0/spmi@c440000/pmic@5} {
+	lcdb: lcdb@ec00 {		/* panel vsp/vsn (stock lcdb_ldo / lcdb_ncp) */
+		compatible = "qcom,pm8150l-lcdb-switch";
+		reg = <0xec00>;
+		regulator-name = "lcdb";
+	};
+};
+
+&{/soc@0/spmi@c440000/pmic@5/leds@d800} {
+	status = "okay";
+	qcom,num-strings = <4>;			/* stock string-cfg 0x0f */
+	qcom,ovp-millivolt = <20500>;		/* stock qcom,ovp 20500 */
+	qcom,current-boost-limit = <1050>;	/* stock boost-current-limit 1050 */
+	default-brightness = <2048>;
+};
+
+&{/soc@0/pinctrl@f100000} {
+	panel_default: panel-default-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	ts_spi_default: ts-spi-default-state {	/* stock qupv3_se13_spi_active */
+		pins = "gpio36", "gpio37", "gpio38", "gpio39";
+		function = "qup13";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	ts_int_default: ts-int-default-state {	/* stock touch_int_mux default */
+		pins = "gpio24";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&{/soc@0/display-subsystem@ae00000} {
+	status = "okay";
+};
+
+&{/soc@0/display-subsystem@ae00000/phy@ae94400} {
+	status = "okay";
+	vdds-supply = <&{/soc@0/rsc@18200000/regulators-0/ldo5}>;	/* vreg_l5a_0p88 */
+};
+
+&{/soc@0/display-subsystem@ae00000/dsi@ae94000} {
+	status = "okay";
+	vdda-supply = <&vreg_l9a_1p2>;
+
+	nio_panel: panel@0 {
+		compatible = "tianma,nt36672c-nio";
+		reg = <0>;
+		vddio-supply = <&vreg_l1c_1p8>;
+		vsp-supply = <&lcdb>;
+		vsn-supply = <&lcdb>;
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 75 1>;	/* GPIO_ACTIVE_LOW */
+		backlight = <&{/soc@0/spmi@c440000/pmic@5/leds@d800}>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&panel_default>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&{/soc@0/display-subsystem@ae00000/dsi@ae94000/ports/port@1/endpoint}>;
+			};
+		};
+	};
+};
+
+&{/soc@0/display-subsystem@ae00000/dsi@ae94000/ports/port@1/endpoint} {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+/* A4 touch: Novatek NT36672C TDDI on QUP1 SE5 (spi13), firmware downloaded after each panel power-on */
+&{/soc@0/dma-controller@a00000} {
+	status = "okay";
+};
+
+&{/soc@0/geniqup@ac0000/spi@a94000} {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&ts_spi_default>;
+
+	touchscreen@0 {
+		compatible = "novatek,nt36672c-spi";
+		reg = <0>;
+		spi-max-frequency = <9600000>;		/* stock 0x927c00 */
+		interrupts-extended = <&{/soc@0/pinctrl@f100000} 24 1>;	/* IRQ_TYPE_EDGE_RISING */
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts_int_default>;
+		panel = <&nio_panel>;
+		firmware-name = "novatek/nt36672c-tianma-nio.bin";
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2520>;
+	};
+};
+
+/* QUP SE firmware is not preloaded for SE13 in this boot chain (proto reads INVALID): let Linux load
+ * it from the qupfw partition image (qupv3fw.elf, SPI segment proto 1 v0xb01). */
+&{/soc@0/geniqup@ac0000} {
+	firmware-name = "qcom/sm8250/nio/qupv3fw.elf";
+};
+
+/* USB3: power the QMP USB3/DP combo PHY like stock (core = pm8150_l9 1.2 V, vdd = pm8150_l18 0.912 V) */
+&{/soc@0/phy@88e8000} {
+	vdda-phy-supply = <&vreg_l9a_1p2>;
+	vdda-pll-supply = <&vreg_l18a_0p92>;
+};
+
+/* USB-C (plug orientation, power/data roles, PD, DisplayPort alt mode): see the "USB-C" section at the end.
+ * The PM8150B Type-C block is run by TCPM (qcom_pmic_tcpm) instead of patch 0007's orientation-only driver. */
+
+/* USB3 redriver enable (stock redriver_enable: gpio12 output-high, pull-up). Without it the SS lanes are
+ * cut and the link falls back to high-speed. Board has onnn,redriver@1a or diodes,pi2dpx1217@52 on
+ * i2c@884000; the latter needs no I2C init ("init-none"). */
+&{/soc@0/pinctrl@f100000} {
+	usb_redriver_en: usb-redriver-en-hog {
+		gpio-hog;
+		gpios = <12 0>;
+		output-high;
+		line-name = "usb3-redriver-en";
+	};
+};
+
+/* i2c15 (QUP2 SE1, gpio44/45): USB3 redriver (onnn@1a or diodes@52) + fsa4480@42 */
+&{/soc@0/geniqup@8c0000} {
+	status = "okay";
+	firmware-name = "qcom/sm8250/nio/qupv3fw.elf";
+};
+
+&{/soc@0/geniqup@8c0000/i2c@884000} {
+	status = "okay";
+	clock-frequency = <400000>;
+};
+
+/* USB3: the base DT still forces UTMI as the PIPE clock (left from the USB2-only bring-up), which keeps
+ * the DWC3 SuperSpeed side dead. Use the QMP PHY's PIPE clock again. */
+&{/soc@0/usb@a6f8800} {
+	/delete-property/ qcom,select-utmi-as-pipe-clk;
+};
+
+/* The rear flash: two PM8150L channels (stock pm8150l_flash0/1, a dual-tone pair), torch and flash */
+&{/soc@0/spmi@c440000/pmic@5/led-controller@d300} {
+	status = "okay";
+
+	led-0 {
+		function = "flash";
+		color = <0>;				/* LED_COLOR_ID_WHITE */
+		led-sources = <1>;
+		led-max-microamp = <100000>;		/* torch */
+		flash-max-microamp = <1000000>;
+		flash-max-timeout-us = <1280000>;
+	};
+
+	led-1 {
+		function = "flash";
+		color = <6>;				/* LED_COLOR_ID_YELLOW: the warm one */
+		led-sources = <2>;
+		led-max-microamp = <100000>;
+		flash-max-microamp = <1000000>;
+		flash-max-timeout-us = <1280000>;
+	};
+};
+
+/* ---- Camera stage 1: power + identify the main rear sensor (OV64B, stock cam-sensor@0) ---- */
+&{/soc@0/pinctrl@f100000} {
+	cam_ldo_cs: cam-ldo-cs-state {			/* WL2864C chip select (stock semi,cs-gpios) */
+		pins = "gpio100";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam0_mclk: cam0-mclk-state {			/* stock cam_sensor_mclk2_active */
+		pins = "gpio96";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	cam0_reset: cam0-reset-state {			/* stock cam_sensor_active_0 */
+		pins = "gpio93";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	/* the other four cameras (stock cam_sensor_mclk<n>_active, cam_sensor_active_<n>) */
+	cam_fuw_mclk: cam-fuw-mclk-state {		/* MCLK0: front ultrawide S5K4H7 */
+		pins = "gpio94";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	cam_fm_mclk: cam-fm-mclk-state {		/* MCLK1: front OV16A1Q */
+		pins = "gpio95";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	cam_depth_mclk: cam-depth-mclk-state {		/* MCLK3: depth OV02B1B */
+		pins = "gpio97";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	cam_uw_mclk: cam-uw-mclk-state {		/* MCLK4: rear ultrawide OV16A10 */
+		pins = "gpio98";
+		function = "cam_mclk";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	cam_fuw_reset: cam-fuw-reset-state {			/* RESET4: S5K4H7 */
+		pins = "gpio78";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_fm_reset: cam-fm-reset-state {			/* RESET1: OV16A1Q */
+		pins = "gpio109";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_depth_reset: cam-depth-reset-state {			/* RESET3: OV02B1B */
+		pins = "gpio99";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_uw_reset: cam-uw-reset-state {			/* RESET2: OV16A10 */
+		pins = "gpio91";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&{/soc@0/geniqup@8c0000/i2c@884000} {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	cam_ldo: regulator@29 {
+		compatible = "willsemi,wl2864c";
+		reg = <0x29>;
+		enable-gpios = <&{/soc@0/pinctrl@f100000} 100 0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_ldo_cs>;
+		vin1-supply = <&vreg_l1c_1p8>;
+
+		regulators {
+			cam0_dvdd: ldo1 {
+				regulator-name = "cam0_dvdd_1p1";
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+			cam_dvdd: ldo2 {		/* stock cam_uw_fm_fuw_dvdd_ldo */
+				regulator-name = "cam_dvdd_1p2";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+			};
+			cam0_avdd: ldo3 {
+				regulator-name = "cam0_avdd_2p8";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+			cam_avdd: ldo4 {		/* stock cam_uw_d_fm_fuw_avdd_ldo */
+				regulator-name = "cam_avdd_2p8";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+			cam0_vaf: ldo5 {
+				regulator-name = "cam0_vaf_2p8";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+			cam_dovdd: ldo7 {
+				regulator-name = "cam_dovdd_1p8";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+		};
+	};
+};
+
+&{/soc@0/cci@ac4f000} {
+	status = "okay";
+};
+
+&{/soc@0/cci@ac4f000/i2c-bus@0} {
+	#size-cells = <0>;
+
+	camera@21 {				/* SCCB 0x21 (also answers at 0x22); AF @0x0c, EEPROM @0x58 */
+		compatible = "ovti,ov64b";
+		reg = <0x21>;
+		clocks = <&{/soc@0/clock-controller@ad00000} 77>;	/* CAM_CC_MCLK2_CLK */
+		power-domains = <&{/soc@0/clock-controller@ad00000} 5>;	/* TITAN_TOP_GDSC: MCLK branches live here */
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 93 1>;		/* XSHUTDOWN, active low */
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam0_mclk &cam0_reset>;
+		dovdd-supply = <&cam_dovdd>;
+		avdd-supply = <&cam0_avdd>;
+		dvdd-supply = <&cam0_dvdd>;
+		rotation = <90>;			/* stock sensor-position-roll */
+		orientation = <1>;			/* back (stock yaw 180) */
+
+		port {
+			cam0_out: endpoint {		/* -> CAMSS CSIPHY2 */
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <849600000>;
+				remote-endpoint = <&csiphy2_in>;
+			};
+		};
+	};
+};
+
+/* The other cameras (stock kona-camera-sensor-mot-nio.dtsi; motcam driver, patch 0028) */
+&{/soc@0/cci@ac4f000/i2c-bus@1} {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	camera@10 {				/* front, OV16A1Q (stock cam-sensor@1) */
+		compatible = "ovti,ov16a1q";
+		reg = <0x10>;
+		clocks = <&{/soc@0/clock-controller@ad00000} 75>;	/* CAM_CC_MCLK1_CLK */
+		power-domains = <&{/soc@0/clock-controller@ad00000} 5>;	/* TITAN_TOP_GDSC */
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 109 1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_fm_mclk &cam_fm_reset>;
+		dovdd-supply = <&cam_dovdd>;
+		avdd-supply = <&cam_avdd>;
+		dvdd-supply = <&cam_dvdd>;
+		rotation = <0>;				/* stock sensor-position-roll */
+		orientation = <0>;			/* front */
+
+		port {
+			cam_fm_out: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <742000000 371000000>;
+				remote-endpoint = <&csiphy1_in>;
+			};
+		};
+	};
+
+	camera@2d {				/* front ultrawide, S5K4H7 (stock cam-sensor@4) */
+		compatible = "samsung,s5k4h7";
+		reg = <0x2d>;
+		clocks = <&{/soc@0/clock-controller@ad00000} 73>;	/* CAM_CC_MCLK0_CLK */
+		power-domains = <&{/soc@0/clock-controller@ad00000} 5>;
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 78 1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_fuw_mclk &cam_fuw_reset>;
+		dovdd-supply = <&cam_dovdd>;
+		avdd-supply = <&cam_avdd>;
+		dvdd-supply = <&cam_dvdd>;
+		rotation = <0>;
+		orientation = <0>;
+
+		port {
+			cam_fuw_out: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <336000000>;
+				remote-endpoint = <&csiphy0_in>;
+			};
+		};
+	};
+};
+
+&{/soc@0/cci@ac50000} {
+	status = "okay";
+};
+
+&{/soc@0/cci@ac50000/i2c-bus@0} {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	camera@10 {				/* rear ultrawide, OV16A10 (stock cam-sensor@2) */
+		compatible = "ovti,ov16a10";
+		reg = <0x10>;
+		clocks = <&{/soc@0/clock-controller@ad00000} 81>;	/* CAM_CC_MCLK4_CLK */
+		power-domains = <&{/soc@0/clock-controller@ad00000} 5>;
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 91 1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_uw_mclk &cam_uw_reset>;
+		dovdd-supply = <&cam_dovdd>;
+		avdd-supply = <&cam_avdd>;
+		dvdd-supply = <&cam_dvdd>;
+		rotation = <90>;
+		orientation = <1>;			/* back */
+
+		port {
+			cam_uw_out: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <786000000 360000000>;
+				remote-endpoint = <&csiphy3_in>;
+			};
+		};
+	};
+
+	camera@3d {				/* rear depth, OV02B1B, monochrome (stock cam-sensor@3) */
+		compatible = "ovti,ov02b1b";
+		reg = <0x3d>;
+		clocks = <&{/soc@0/clock-controller@ad00000} 79>;	/* CAM_CC_MCLK3_CLK */
+		power-domains = <&{/soc@0/clock-controller@ad00000} 5>;
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 99 1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_depth_mclk &cam_depth_reset>;
+		dovdd-supply = <&cam_dovdd>;
+		avdd-supply = <&cam_avdd>;
+		rotation = <90>;
+		orientation = <1>;
+
+		port {
+			cam_depth_out: endpoint {
+				data-lanes = <1>;
+				link-frequencies = /bits/ 64 <330000000>;
+				remote-endpoint = <&csiphy4_in>;
+			};
+		};
+	};
+};
+
+/* Camera stage 3: CAMSS CSIPHY2 <- OV64B (stock csiphy-sd-index 2, laneAssign 0x3210) */
+&{/soc@0/camss@ac6a000} {
+	status = "okay";
+	vdda-phy-supply = <&{/soc@0/rsc@18200000/regulators-0/ldo5}>;	/* vreg_l5a_0p88 */
+	vdda-pll-supply = <&vreg_l9a_1p2>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {				/* S5K4H7 (stock csiphy-sd-index 0) */
+			reg = <0>;
+			csiphy0_in: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&cam_fuw_out>;
+			};
+		};
+
+		port@1 {				/* OV16A1Q */
+			reg = <1>;
+			csiphy1_in: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&cam_fm_out>;
+			};
+		};
+
+		port@2 {
+			reg = <2>;
+			csiphy2_in: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&cam0_out>;
+			};
+		};
+
+		port@3 {				/* OV16A10 */
+			reg = <3>;
+			csiphy3_in: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&cam_uw_out>;
+			};
+		};
+
+		port@4 {				/* OV02B1B, one lane */
+			reg = <4>;
+			csiphy4_in: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0>;
+				remote-endpoint = <&cam_depth_out>;
+			};
+		};
+	};
+};
+
+/* ---- Hardware buttons (stock: PON pwrkey/resin, gpio-keys vol_up on PM8150 GPIO6, assist on TLMM 14) ---- */
+&{/soc@0/spmi@c440000/pmic@0/pon@800/pwrkey} {
+	status = "okay";
+};
+
+&{/soc@0/spmi@c440000/pmic@0/pon@800/resin} {
+	status = "okay";
+	linux,code = <114>;				/* KEY_VOLUMEDOWN */
+};
+
+&{/soc@0/spmi@c440000/pmic@0/gpio@c000} {
+	key_vol_up_default: key-vol-up-state {		/* stock key_vol_up_default */
+		pins = "gpio6";
+		function = "normal";
+		input-enable;
+		bias-pull-up;
+		power-source = <1>;
+	};
+};
+
+&{/soc@0/pinctrl@f100000} {
+	key_assist_default: key-assist-state {		/* stock tlmm_gpio_key gpio_key_active */
+		pins = "gpio14";
+		function = "gpio";
+		bias-pull-up;
+	};
+};
+
+/ {
+	gpio-keys {
+		compatible = "gpio-keys";
+		label = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&key_vol_up_default &key_assist_default>;
+
+		key-vol-up {
+			label = "volume_up";
+			gpios = <&{/soc@0/spmi@c440000/pmic@0/gpio@c000} 6 1>;	/* GPIO_ACTIVE_LOW */
+			linux,input-type = <1>;
+			linux,code = <115>;			/* KEY_VOLUMEUP */
+			wakeup-source;
+			debounce-interval = <15>;
+			linux,can-disable;
+		};
+
+		key-assist {
+			label = "assist_key";
+			gpios = <&{/soc@0/pinctrl@f100000} 14 1>;
+			linux,input-type = <1>;
+			linux,code = <217>;			/* KEY_SEARCH, as stock */
+			debounce-interval = <15>;
+			linux,can-disable;
+		};
+	};
+};
+
+// Wi-Fi: QCA6390 on PCIe0 (ath11k), powered through the WCN power sequencer like qrb5165-rb5.
+// Supplies from the stock qcom,cnss-qca6390 node: aon/dig = pm8150_s6, io = pm8150_s4, rfa1 = pm8150_s5,
+// rfa2 = pm8150l_s8, antenna switch = pm8150l_l5; wlan-en tlmm 20, bt-en tlmm 21 (sw-ctrl 124 unused).
+&{/soc@0/rsc@18200000/regulators-0} {
+	vreg_s5a_1p9: smps5 {
+		regulator-name = "vreg_s5a_1p9";
+		regulator-min-microvolt = <1904000>;
+		regulator-max-microvolt = <2000000>;
+		regulator-initial-mode = <3>;
+	};
+
+	vreg_s6a_0p95: smps6 {
+		regulator-name = "vreg_s6a_0p95";
+		regulator-min-microvolt = <920000>;
+		regulator-max-microvolt = <1128000>;
+		regulator-initial-mode = <3>;
+	};
+};
+
+&{/soc@0/rsc@18200000/regulators-1} {
+	vreg_s8c_1p3: smps8 {
+		regulator-name = "vreg_s8c_1p3";
+		regulator-min-microvolt = <1352000>;
+		regulator-max-microvolt = <1352000>;
+		regulator-initial-mode = <3>;
+	};
+
+	vreg_l5c_1p8: ldo5 {		/* WLAN antenna switch; no upstream consumer, keep it on */
+		regulator-name = "vreg_l5c_1p8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-initial-mode = <3>;
+		regulator-always-on;
+	};
+};
+
+&{/soc@0/pinctrl@f100000} {
+	wlan_en_state: wlan-default-state {
+		pins = "gpio20";
+		function = "gpio";
+		drive-strength = <16>;
+		output-low;
+		bias-pull-up;
+	};
+
+	bt_en_state: bt-default-state {
+		pins = "gpio21";
+		function = "gpio";
+		drive-strength = <16>;
+		output-low;
+		bias-pull-up;
+	};
+};
+
+/ {
+	vreg_s4a_1p8: vreg-s4a-1p8 {
+		compatible = "regulator-fixed";
+		regulator-name = "vreg_s4a_1p8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	qca6390-pmu {
+		compatible = "qcom,qca6390-pmu";
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_en_state &wlan_en_state>;
+
+		vddaon-supply = <&vreg_s6a_0p95>;
+		vddpmu-supply = <&vreg_s6a_0p95>;
+		vddrfa0p95-supply = <&vreg_s6a_0p95>;
+		vddrfa1p3-supply = <&vreg_s8c_1p3>;
+		vddrfa1p9-supply = <&vreg_s5a_1p9>;
+		vddpcie1p3-supply = <&vreg_s8c_1p3>;
+		vddpcie1p9-supply = <&vreg_s5a_1p9>;
+		vddio-supply = <&vreg_s4a_1p8>;
+
+		wlan-enable-gpios = <&{/soc@0/pinctrl@f100000} 20 0>;
+		bt-enable-gpios = <&{/soc@0/pinctrl@f100000} 21 0>;
+
+		regulators {
+			vreg_pmu_rfa_cmn: ldo0 { regulator-name = "vreg_pmu_rfa_cmn"; };
+			vreg_pmu_aon_0p59: ldo1 { regulator-name = "vreg_pmu_aon_0p59"; };
+			vreg_pmu_wlcx_0p8: ldo2 { regulator-name = "vreg_pmu_wlcx_0p8"; };
+			vreg_pmu_wlmx_0p85: ldo3 { regulator-name = "vreg_pmu_wlmx_0p85"; };
+			vreg_pmu_btcmx_0p85: ldo4 { regulator-name = "vreg_pmu_btcmx_0p85"; };
+			vreg_pmu_rfa_0p8: ldo5 { regulator-name = "vreg_pmu_rfa_0p8"; };
+			vreg_pmu_rfa_1p2: ldo6 { regulator-name = "vreg_pmu_rfa_1p2"; };
+			vreg_pmu_rfa_1p7: ldo7 { regulator-name = "vreg_pmu_rfa_1p7"; };
+			vreg_pmu_pcie_0p9: ldo8 { regulator-name = "vreg_pmu_pcie_0p9"; };
+			vreg_pmu_pcie_1p8: ldo9 { regulator-name = "vreg_pmu_pcie_1p8"; };
+		};
+	};
+};
+
+&{/soc@0/phy@1c06000} {		/* PCIe0 QMP PHY; stock: 0.88 V pm8150_l5, 1.2 V pm8150_l9 */
+	status = "okay";
+	vdda-phy-supply = <&{/soc@0/rsc@18200000/regulators-0/ldo5}>;
+	vdda-pll-supply = <&vreg_l9a_1p2>;
+};
+
+&{/soc@0/pcie@1c00000} {
+	status = "okay";
+};
+
+&{/soc@0/pcie@1c00000/pcie@0} {
+	wifi@0 {
+		compatible = "pci17cb,1101";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
+		vddaon-supply = <&vreg_pmu_aon_0p59>;
+		vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
+		vddwlmx-supply = <&vreg_pmu_wlmx_0p85>;
+		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
+		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
+	};
+};
+
+// Charging: PM8150B SMB5 charger + FG gen4 fuel gauge (drivers/power/supply/qcom_pm8150b_charger.c).
+// Limits from the stock DT: qcom,qpnp-smb5 (fcc-max 4 A, fv-max 4.45 V, usb-icl 3 A), battery profile
+// 4794299/4793128 moto LZ50 5000 mAh, qcom,qpnp-smbcharger-mmi (iterm 150 mA, mmi-temp-zones).
+&{/soc@0/spmi@c440000/pmic@2/adc@3100} {
+	channel@8 {
+		reg = <0x08>;			/* ADC5_USB_IN_V_16 */
+		qcom,pre-scaling = <1 16>;
+		label = "usb_in_v_div_16";
+	};
+};
+
+&{/soc@0/spmi@c440000/pmic@2} {
+	charger@1000 {
+		compatible = "qcom,pm8150b-charger-fg";
+		reg = <0x1000>;
+		interrupts = <0x2 0x13 0x4 3>,	/* usbin-plugin, both edges */
+			     <0x2 0x13 0x6 1>,	/* usbin-src-change (APSD) */
+			     <0x2 0x13 0x7 1>,	/* usbin-icl-change */
+			     <0x2 0x10 0x1 1>;	/* chg-state-change */
+		interrupt-names = "usb-plugin", "usb-source-change", "usbin-icl-change", "chg-state-change";
+		io-channels = <&{/soc@0/spmi@c440000/pmic@2/adc@3100} 0x08>;
+		io-channel-names = "usb_in_v";
+		constant-charge-current-max-microamp = <4000000>;
+		constant-charge-voltage-max-microvolt = <4450000>;
+		input-current-limit-max-microamp = <3000000>;
+		charge-term-current-milliamp = <150>;
+		charge-full-design-microamp-hours = <5000000>;
+		/* <upper temp C, step mV, FCC below step mA, FCC above step mA (0 = hold at step)> */
+		mmi,temp-zones = <0 4200 970 0>,
+				 <10 4200 2500 970>,
+				 <15 0 2500 2500>,
+				 <45 4200 4000 3600>,
+				 <60 4200 2500 0>;
+	};
+};
+
+// Bluetooth: QCA6390 BT core on QUP0 SE6 high-speed UART (serial@998000, gpio16-19 = CTS/RTS/TX/RX), stock
+// "qcom,qup_uart@998000" + bt_qca6390; power through the qca6390-pmu (bt-en tlmm 21) like qrb5165-rb5.
+/ {
+	aliases {
+		serial1 = "/soc@0/geniqup@9c0000/serial@998000";
+	};
+};
+
+&{/soc@0/geniqup@9c0000} {
+	status = "okay";
+	firmware-name = "qcom/sm8250/nio/qupv3fw.elf";	/* SE protocol fw is not preloaded in this chain */
+};
+
+&{/soc@0/pinctrl@f100000/qup-uart6-default-state} {
+	/* pins/function inherited (gpio16-19, qup6); per-pin config below */
+	cts-pins {
+		pins = "gpio16";
+		function = "qup6";
+		drive-strength = <2>;
+		bias-bus-hold;
+	};
+
+	rts-tx-pins {
+		pins = "gpio17", "gpio18";
+		function = "qup6";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	rx-pins {
+		pins = "gpio19";
+		function = "qup6";
+		drive-strength = <2>;
+		bias-pull-up;		/* keep RX idle-high while the BT core is off */
+	};
+};
+
+&{/soc@0/geniqup@9c0000/serial@998000} {
+	status = "okay";
+
+	bluetooth {
+		compatible = "qcom,qca6390-bt";
+		/* the phone's own address (stock androidboot.btmacaddr), not in git: cargo xtask fit puts in boot/bd-address */
+		local-bd-address = [00 00 00 00 00 00];
+		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
+		vddaon-supply = <&vreg_pmu_aon_0p59>;
+		vddbtcmx-supply = <&vreg_pmu_btcmx_0p85>;
+		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
+	};
+};
+
+// Audio DSP (ADSP / LPASS Q6): stock modem-partition image /image/adsp.mdt + adsp.b00-b18 (ports/nio/firmware/nio-adsp),
+// PAS-authenticated by TZ (EL2 SHM bridge in mdt_loader, patch 0003). APR services (q6core/afe/asm/adm) and
+// fastrpc come from the base sm8250 node.
+&{/soc@0/remoteproc@17300000} {
+	status = "okay";
+	firmware-name = "qcom/sm8250/nio/adsp.mdt";
+	/* Without QHEE the Q6 core (SID 0x1800) reaches DDR through the apps SMMU: identity domain
+	 * (arm-smmu-qcom client list). QHEE's LPASS clock/boot-vector bring-up is in qcom_q6v5_pas. */
+	iommus = <&{/soc@0/iommu@15000000} 0x1800 0x0>;
+};
+
+// EL2 replacement for QHEE's boot-time memory sharing (TZ MEM_ASSIGN, recovered in archive/qhee-analysis:
+// reports/qhee-offline/smem-partition-contracts.json, test_smem_assign.py, test_init_assign.py,
+// tz-channel ledgers). qcom_scm replays these at probe when Linux runs at EL2 (patch 0011).
+// <vmid perm>: perm 4 = R, 6 = RW. VMIDs: 3 HLOS, 6 ADSP, 5 SLPI, 30 CDSP, 27/26/40/4/1/2/21/22/42 others.
+&{/firmware/scm} {
+	mothership,el2-mem-assign-at-boot;
+	el2-mem-assign {
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		smem-toc { reg = <0 0x80aff000 0 0x1000>;
+			qcom,vmid-perms = <3 4>, <6 4>, <5 4>, <30 4>, <27 4>, <4 4>, <40 4>, <26 4>; };
+		smem-p-adsp { reg = <0 0x80acf000 0 0x30000>; qcom,vmid-perms = <3 6>, <6 6>; };
+		smem-p-cdsp { status = "disabled"; reg = <0 0x80aaf000 0 0x20000>; qcom,vmid-perms = <3 6>, <30 6>; };
+		smem-p-slpi { status = "disabled"; reg = <0 0x80a7f000 0 0x30000>; qcom,vmid-perms = <3 6>, <5 6>; };
+		smem-p-adsp-slpi { reg = <0 0x80a73000 0 0xc000>; qcom,vmid-perms = <3 4>, <6 6>, <5 6>; };
+		smem-p-27 { status = "disabled"; reg = <0 0x80a6b000 0 0x8000>; qcom,vmid-perms = <3 6>, <27 6>; };
+		smem-p-1-26 { status = "disabled"; reg = <0 0x80a67000 0 0x4000>; qcom,vmid-perms = <3 4>, <1 6>, <26 6>; };
+		smem-p-40 { status = "disabled"; reg = <0 0x80a57000 0 0x10000>; qcom,vmid-perms = <3 6>, <40 6>; };
+		smem-p-cdsp-40 { status = "disabled"; reg = <0 0x80a47000 0 0x10000>; qcom,vmid-perms = <3 4>, <30 6>, <40 6>; };
+		smem-global { reg = <0 0x80901000 0 0x146000>;
+			qcom,vmid-perms = <3 6>, <6 6>, <5 6>, <30 6>, <27 6>, <4 6>, <40 6>, <26 6>; };
+		smem-header { reg = <0 0x80900000 0 0x1000>;
+			qcom,vmid-perms = <3 6>, <6 6>, <5 6>, <30 6>, <27 6>, <4 6>, <40 6>, <26 6>; };
+		cmd-db { status = "disabled"; reg = <0 0x80860000 0 0x20000>;
+			qcom,vmid-perms = <1 4>, <2 4>, <5 4>, <3 4>, <6 4>, <26 4>, <30 4>, <22 4>; };
+		tz-channel-21-22 { status = "disabled"; reg = <0 0x80dc1000 0 0x1000>; qcom,vmid-perms = <21 6>, <22 6>; };
+		tz-channel-21-42 { status = "disabled"; reg = <0 0x80ddc000 0 0x2000>; qcom,vmid-perms = <21 6>, <42 6>; };
+	};
+};
+
+// QHEE also shares CMD-DB read-only with the ADSP before the TZ SHM bridge is enabled (after that TZ
+// rejects it). The ADSP reads it at boot; without it the DSP dies on its first CMD-DB access.
+&{/firmware/scm} { mothership,el2-cmdb-share-adsp; };
+
+// ---- Built-in speaker (2026-10-12) ----
+// Awinic AW882xx (chip 0x1852) smart PA on i2c15@0x34, reset gpio139 (active low), fed by the ADSP AFE
+// TERTIARY_MI2S_RX on data line SD1 (gpio133 sck / gpio135 ws / gpio137 data). Fixed -36 dB gain in
+// aw882xx_nio until ADSP speaker protection exists. Route: MultiMedia1 -> TERT_MI2S_RX Audio Mixer.
+&{/soc@0/pinctrl@f100000} {
+	nio_tert_mi2s: nio-tert-mi2s-state {
+		sck { pins = "gpio133"; function = "mi2s2_sck"; drive-strength = <8>; bias-disable; };
+		ws { pins = "gpio135"; function = "mi2s2_ws"; drive-strength = <8>; bias-disable; };
+		sd1 { pins = "gpio137"; function = "mi2s2_data1"; drive-strength = <8>; bias-disable; };
+		sd0 { pins = "gpio136"; function = "mi2s2_data0"; drive-strength = <8>; bias-disable; };	/* amp V/I out */
+	};
+};
+
+&{/soc@0/geniqup@8c0000/i2c@884000} {
+	nio_speaker: speaker@34 {
+		compatible = "mothership,nio-aw882xx";
+		reg = <0x34>;
+		reset-gpios = <&{/soc@0/pinctrl@f100000} 139 1>;
+		#sound-dai-cells = <0>;
+	};
+};
+
+// Speaker protection = Awinic SKT inside the stock ADSP firmware (modules 0x10013D00/01), configured as
+// the stock ACDB does (ports/nio/rootfs/audio/acdb_extract.py): custom topologies registered via
+// AVCS, speaker port topology 0x1000FF01 + tuning + calibrated Re (persist aw_cali.bin), V/I feedback
+// port TERT_MI2S_TX (SD0, 2ch S32) with topology 0x1000FF00, AFE feedback path TX -> RX.
+&{/soc@0/remoteproc@17300000/glink-edge/apr/service@3} {
+	mothership,custom-topologies = "qcom/sm8250/nio/nio-avcs-topologies.bin";
+};
+
+&{/soc@0/remoteproc@17300000/glink-edge/apr/service@4/dais} {
+	dai@20 {						/* TERTIARY_MI2S_RX: speaker */
+		reg = <20>;
+		qcom,sd-lines = <1>;
+		mothership,afe-topology = <0x1000ff01>;
+		mothership,afe-cal = "qcom/sm8250/nio/nio-spk-afe-cal.bin";
+		mothership,feedback-dai = <21>;
+	};
+	dai@21 {						/* TERTIARY_MI2S_TX: amp V/I feedback */
+		reg = <21>;
+		qcom,sd-lines = <0>;
+		mothership,afe-topology = <0x1000ff00>;
+		mothership,afe-cal = "qcom/sm8250/nio/nio-vi-afe-cal.bin";
+		mothership,feedback-channels = <2>;
+	};
+};
+
+&{/soc@0/remoteproc@17300000/glink-edge/apr/service@7/dais} {
+	dai@0 { reg = <0>; };					/* MultiMedia1: speaker */
+	dai@1 { reg = <1>; };					/* MultiMedia2: DisplayPort */
+};
+
+/ {
+	sound {
+		compatible = "qcom,sm8250-sndcard";
+		model = "mothership-nio-speaker";
+		mothership,tert-mi2s-s32-mono;		/* stock framing: S32 mono speaker, 64fs */
+		pinctrl-names = "default";
+		pinctrl-0 = <&nio_tert_mi2s>;
+		widgets = "Speaker", "Speaker";
+		audio-routing = "Speaker", "Speaker Output";
+
+		/* front end first: q6asm-dai must probe before q6routing adds its routes */
+		mm1-link {
+			link-name = "MultiMedia1";
+			cpu { sound-dai = <&{/soc@0/remoteproc@17300000/glink-edge/apr/service@7/dais} 0>; };
+		};
+
+		mm2-link {
+			link-name = "MultiMedia2";
+			cpu { sound-dai = <&{/soc@0/remoteproc@17300000/glink-edge/apr/service@7/dais} 1>; };
+		};
+
+		speaker-link {
+			link-name = "Nio Speaker";
+			cpu { sound-dai = <&{/soc@0/remoteproc@17300000/glink-edge/apr/service@4/dais} 20>; };
+			platform { sound-dai = <&{/soc@0/remoteproc@17300000/glink-edge/apr/service@8/routing}>; };
+			codec { sound-dai = <&nio_speaker>; };
+		};
+
+		/* USB-C DisplayPort audio (as qcm6490-fairphone-fp5): Q6 AFE DISPLAY_PORT_RX (104) -> the DP controller's
+		 * audio; MultiMedia2 -> "DISPLAY_PORT_RX Audio Mixer MultiMedia2" */
+		dp-link {
+			link-name = "DisplayPort Playback";
+			cpu { sound-dai = <&{/soc@0/remoteproc@17300000/glink-edge/apr/service@4/dais} 104>; };
+			platform { sound-dai = <&{/soc@0/remoteproc@17300000/glink-edge/apr/service@8/routing}>; };
+			codec { sound-dai = <&{/soc@0/display-subsystem@ae00000/displayport-controller@ae90000}>; };
+		};
+	};
+};
+
+/* ---- USB-C: TCPM on the PM8150B Type-C/PD block, dual role, DisplayPort alt mode (as qrb5165-rb5) ----
+ * graph: connector port@0 (HS) - dwc3 port@0; connector port@1 (SS) - NB7VPQ904M retimer port@0, retimer port@1 -
+ * QMP combo PHY port@0; connector port@2 (SBU) - retimer port@2; DP controller out - PHY port@2 (DP in, 2 lanes,
+ * USB3 stays on the other 2). The dwc3 starts as a device (dev link to a PC) and follows the Type-C data role. */
+&{/soc@0/spmi@c440000/pmic@2/usb-vbus-regulator@1100} {
+	status = "okay";
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <1500000>;
+};
+
+&{/soc@0/spmi@c440000/pmic@2/typec@1500} {
+	status = "okay";
+	vdd-pdphy-supply = <&{/soc@0/rsc@18200000/regulators-0/ldo2}>;
+
+	connector {
+		compatible = "usb-c-connector";
+		power-role = "dual";
+		try-power-role = "sink";		/* a PC or charger keeps charging the phone */
+		data-role = "dual";
+		self-powered;
+		/* PDO_FIXED(5000 mV, 900 mA, DUAL_ROLE | USB_COMM | DATA_SWAP) */
+		source-pdos = <0x2601905a>;
+		/* PDO_FIXED(5000 mV, 3000 mA, DUAL_ROLE | USB_COMM | DATA_SWAP) */
+		sink-pdos = <0x2601912c>;
+		op-sink-microwatt = <10000000>;
+
+		altmodes {
+			displayport {
+				svid = /bits/ 16 <0xff01>;
+				vdo = <0x00001c46>;		/* DP sink pin assignments C/D/E, as rb5 */
+			};
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				usbc_hs_in: endpoint {
+					remote-endpoint = <&{/soc@0/usb@a6f8800/usb@a600000/ports/port@0/endpoint}>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				usbc_ss_in: endpoint {
+					remote-endpoint = <&redriver_usb_con_ss>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+				usbc_sbu_out: endpoint {
+					remote-endpoint = <&redriver_usb_con_sbu>;
+				};
+			};
+		};
+	};
+};
+
+/* NB7VPQ904M USB3/DP retimer (i2c15 @0x1a; enable gpio12 stays a hog above). Also the plug orientation switch:
+ * it forwards orientation to the QMP PHY. Its 1.8 V VCC is on whenever the phone is (the chip answers before
+ * Linux touches anything) and its rail isn't modelled here; the driver insists on a vcc supply, so it gets a
+ * software-only fixed one. */
+/ {
+	nb7_vcc: regulator-nb7-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nb7_vcc_1p8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+};
+
+&{/soc@0/geniqup@8c0000/i2c@884000} {
+	typec-mux@1a {
+		compatible = "onnn,nb7vpq904m";
+		reg = <0x1a>;
+		vcc-supply = <&nb7_vcc>;
+		retimer-switch;
+		orientation-switch;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				redriver_usb_con_ss: endpoint {
+					remote-endpoint = <&usbc_ss_in>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				redriver_phy_con_ss: endpoint {
+					remote-endpoint = <&{/soc@0/phy@88e8000/ports/port@0/endpoint}>;
+					data-lanes = <0 1 2 3>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+				redriver_usb_con_sbu: endpoint {
+					remote-endpoint = <&usbc_sbu_out>;
+				};
+			};
+		};
+	};
+};
+
+&{/soc@0/phy@88e8000/ports/port@0/endpoint} {
+	remote-endpoint = <&redriver_phy_con_ss>;
+};
+
+/* The PHY follows the DP pin assignment (the retimer forwards it): C/E = 4-lane DP only (4K60; USB stays USB 2.0),
+ * D = USB3 + 2-lane DP. Without mode-switch it stays in USB3+DP and DP is limited to 2 lanes. */
+&{/soc@0/phy@88e8000} {
+	mode-switch;
+};
+
+&{/soc@0/phy@88e8000/ports/port@2/endpoint} {
+	remote-endpoint = <&{/soc@0/display-subsystem@ae00000/displayport-controller@ae90000/ports/port@1/endpoint}>;
+};
+
+&{/soc@0/usb@a6f8800/usb@a600000} {
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";	/* the dev link comes up as before, then TCPM decides */
+};
+
+&{/soc@0/usb@a6f8800/usb@a600000/ports/port@0/endpoint} {
+	remote-endpoint = <&usbc_hs_in>;
+};
+
+&{/soc@0/display-subsystem@ae00000/displayport-controller@ae90000} {
+	status = "okay";
+};
+
+&{/soc@0/display-subsystem@ae00000/displayport-controller@ae90000/ports/port@1/endpoint} {
+	data-lanes = <0 1 2 3>;	/* up to 4; the link uses what the pin assignment and the sink allow */
+	remote-endpoint = <&{/soc@0/phy@88e8000/ports/port@2/endpoint}>;
+};
+
+/* Hardware video decode at EL2 without QHEE: non-secure (no-TZ) bring-up, as the &venus stanza of
+ * ports/nio/kernel/dts/sm8250-motorola-nio.dts. The video-firmware subnode makes the venus driver load the
+ * firmware itself and skip TZ's secure-SID step (unreachable from our EL2; ports/nio/docs/video.md). The firmware
+ * (upstream non-secure iris2, linux-firmware qcom/vpu-1.0) is in the initramfs as venus-vpu.mbn. Its SMMU streams
+ * are {0x2102, 0x2502}: SID 0x2102 mask 0x400. */
+&{/soc@0/video-codec@aa00000} {
+	firmware-name = "qcom/sm8250/nio/venus-vpu.mbn";
+	status = "okay";
+
+	video-firmware {
+		iommus = <&{/soc@0/iommu@15000000} 0x2102 0x400>;
+	};
+};
+
+/* Modem: Snapdragon X55 (SDX55, PCI 17cb:0306) on PCIe2, MHI. No flash of its own: its PBL waits for the
+ * PCIe link, the host pushes sbl1 (BHI) and serves the rest over Sahara. Stock (qcom,mdm0 "qcom,ext-sdx55m",
+ * esoc): ap2mdm-status gpio56, ap2mdm-errfatal gpio57, mdm2ap-status gpio3, mdm2ap-errfatal gpio1;
+ * PCIe2 perst gpio85, wake gpio87; PHY 0.88 V pm8150_l5, 1.2 V pm8150_l9 (as PCIe0).
+ * The host side of the handshake: status high (the AP is up), errfatal low, before PCIe2 probes. */
+&{/soc@0/pinctrl@f100000} {
+	ap2mdm-status-hog {
+		gpio-hog;
+		gpios = <56 0>;
+		output-high;
+		line-name = "ap2mdm-status";
+	};
+
+	ap2mdm-errfatal-hog {
+		gpio-hog;
+		gpios = <57 0>;
+		output-low;
+		line-name = "ap2mdm-errfatal";
+	};
+};
+
+&{/soc@0/phy@1c16000} {
+	status = "okay";
+	vdda-phy-supply = <&{/soc@0/rsc@18200000/regulators-0/ldo5}>;
+	vdda-pll-supply = <&vreg_l9a_1p2>;
+};
+
+&{/soc@0/pcie@1c10000} {
+	status = "okay";
+};
+
+/* the modem's PCI node: "qcom,ext-sdx55m" selects the fusion profile of mhi_pci_generic (patch 0025) */
+&{/soc@0/pcie@1c10000/pcie@0} {
+	modem@0 {
+		compatible = "pci17cb,306", "qcom,ext-sdx55m";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+	};
+};

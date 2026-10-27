@@ -1,0 +1,70 @@
+== firmware/nio-camera/com.qti.sensormodule.mot_nio_ov02b1b.bin
+sensor mot_ov02b1b  id reg 0x0003 = 0x2b
+regs: x_out 0x4f y_out 0x51 VTS 0x14 HTS 0x25 exposure 0xe gain 0x22
+power up   [('MCLK', 24000000, 1), ('RESET', 0, 1), ('VAF', 1, 0), ('VANA', 1, 0), ('VIO', 1, 5), ('RESET', 1, 10)]
+power down [('MCLK', 0, 0), ('RESET', 0, 0), ('VIO', 0, 0), ('VANA', 0, 1), ('VAF', 0, 0)]
+mode0: 30.02 fps, 1 lanes, llp 448 fll 1227, bin 1x1, opclk 66000000, cfa 4, 9 regs: vc0 RAW10 1600x1200@(0,0)
+init: 95 regs
+  small regSetting 0x0000=00
+  small regSetting 0x0000=00
+== firmware/nio-camera/com.qti.sensormodule.mot_nio_ov16a10.bin
+sensor mot_ov16a10  id reg 0x300b = 0x1641
+regs: x_out 0x3808 y_out 0x380a VTS 0x380e HTS 0x380c exposure 0x3500 gain 0x3508
+power up   [('MCLK', 24000000, 1), ('RESET', 0, 1), ('VAF', 1, 0), ('VANA', 1, 0), ('VDIG', 1, 0), ('VIO', 1, 1), ('RESET', 1, 4)]
+power down [('MCLK', 0, 0), ('RESET', 0, 0), ('VIO', 0, 0), ('VDIG', 0, 0), ('VANA', 0, 1), ('VAF', 0, 0)]
+mode0: 30.00 fps, 4 lanes, llp 5347 fll 3920, bin 1x1, opclk 628800000, cfa 0, 74 regs: vc0 RAW10 4608x3456@(0,0)
+mode1: 60.00 fps, 4 lanes, llp 2449 fll 1960, bin 2x2, opclk 288000000, cfa 0, 71 regs: vc0 RAW10 1920x1080@(0,0)
+init: 639 regs
+  small regSetting 0x0100=01
+  small regSetting 0x0100=00
+  small regSetting 0x3208=00
+  small regSetting 0x3208=10 0x3208=a0
+  small regSetting 0x350a=100 0x4019=40
+  small regSetting 0x350a=00 0x4019=00
+== firmware/nio-camera/com.qti.sensormodule.mot_nio_ov16a1q.bin
+sensor mot_ov16a1q  id reg 0x300b = 0x1641
+regs: x_out 0x3808 y_out 0x380a VTS 0x380e HTS 0x380c exposure 0x3500 gain 0x3508
+power up   [('MCLK', 24000000, 1), ('RESET', 0, 1), ('VANA', 1, 0), ('VDIG', 1, 0), ('VIO', 1, 1), ('RESET', 1, 4)]
+power down [('MCLK', 0, 0), ('RESET', 0, 0), ('VIO', 0, 0), ('VDIG', 0, 0), ('VANA', 0, 1)]
+mode0: 30.01 fps, 4 lanes, llp 850 fll 3920, bin 1x1, opclk 593600000, cfa 0, 94 regs: vc0 RAW10 4608x3456@(0,0)
+mode1: 30.01 fps, 4 lanes, llp 850 fll 3920, bin 2x2, opclk 296800000, cfa 0, 94 regs: vc0 RAW10 2304x1728@(0,0)
+mode2: 120.00 fps, 4 lanes, llp 750 fll 1114, bin 2x2, opclk 593600000, cfa 0, 94 regs: vc0 RAW10 1920x1080@(192,324)
+mode3: 240.10 fps, 4 lanes, llp 425 fll 980, bin 2x2, opclk 593600000, cfa 0, 94 regs: vc0 RAW10 1280x720@(512,504)
+init: 557 regs
+  small regSetting 0x0100=01
+  small regSetting 0x0100=00
+  small regSetting 0x3208=00
+  small regSetting 0x3208=10 0x3208=a0
+  small regSetting 0x350a=100 0x4019=40
+  small regSetting 0x350a=00 0x4019=00
+== firmware/nio-camera/com.qti.sensormodule.mot_nio_ov64b.bin
+sensor mot_ov64b  id reg 0x300a = 0x5664
+regs: x_out 0x3808 y_out 0x380a VTS 0x380e HTS 0x380c exposure 0x3500 gain 0x3508
+power up   [('MCLK', 24000000, 1), ('RESET', 0, 1), ('VAF', 1, 0), ('VANA', 1, 0), ('VDIG', 1, 0), ('VIO', 1, 1), ('RESET', 1, 4)]
+power down [('MCLK', 0, 0), ('RESET', 0, 0), ('VIO', 0, 0), ('VDIG', 0, 0), ('VANA', 0, 1), ('VAF', 0, 0)]
+mode0: 10.00 fps, 4 lanes, llp 1608 fll 7164, bin 1x1, opclk 798720000, cfa 0, 160 regs: vc0 RAW10 9248x6944@(0,0)
+mode1: 30.02 fps, 4 lanes, llp 936 fll 4102, bin 2x2, opclk 679680000, cfa 0, 319 regs: vc0 RAW10 4624x3472@(0,0), vc1 RAW10 576x428@(0,0) PD
+mode2: 30.00 fps, 4 lanes, llp 1080 fll 3552, bin 1x1, opclk 798720000, cfa 0, 161 regs: vc0 RAW10 6016x3384@(1616,1780), vc1 RAW10 752x844@(192,418) PD
+mode3: 60.00 fps, 4 lanes, llp 840 fll 2284, bin 2x2, opclk 798720000, cfa 0, 161 regs: vc0 RAW10 3840x2160@(392,656), vc1 RAW10 960x540@(88,160) PD
+mode4: 120.00 fps, 4 lanes, llp 504 fll 1904, bin 4x4, opclk 679680000, cfa 0, 159 regs: vc0 RAW10 1920x1080@(196,328)
+mode5: 240.00 fps, 4 lanes, llp 300 fll 1600, bin 4x4, opclk 798720000, cfa 0, 159 regs: vc0 RAW10 1280x720@(516,508)
+init: 2815 regs
+  small regSetting 0x0100=01
+  small regSetting 0x0100=00
+  small regSetting 0x3208=00
+  small regSetting 0x3208=10 0x3208=a0
+  small regSetting 0x350a=100 0x4019=40
+  small regSetting 0x350a=00 0x4019=00
+== firmware/nio-camera/com.qti.sensormodule.mot_nio_s5k4h7_front.bin
+sensor mot_s5k4h7_front  id reg 0x0000 = 0x487b
+regs: x_out 0x34c y_out 0x34e VTS 0x340 HTS 0x342 exposure 0x202 gain 0x204
+power up   [('MCLK', 24000000, 1), ('RESET', 0, 1), ('VANA', 1, 0), ('VDIG', 1, 0), ('VIO', 1, 1), ('RESET', 1, 4)]
+power down [('MCLK', 0, 0), ('RESET', 0, 0), ('VIO', 0, 0), ('VDIG', 0, 0), ('VANA', 0, 1)]
+mode0: 30.03 fps, 4 lanes, llp 3580 fll 2530, bin 1x1, opclk 268800000, cfa 2, 50 regs: vc0 RAW10 3264x2448@(0,0)
+init: 44 regs
+  small regSetting 0x0100=01 0x0106=01
+  small regSetting 0x0100=00
+  small regSetting 0x0104=00
+  small regSetting 0x0104=00
+  small regSetting 0x0600=00
+  small regSetting 0x0600=01

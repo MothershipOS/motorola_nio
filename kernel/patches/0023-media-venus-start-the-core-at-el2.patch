@@ -1,0 +1,417 @@
+From: mothershipOS
+Subject: [PATCH] media: venus: start the core at EL2 without QHEE
+
+TZ's auth_and_reset only authenticates the firmware; the stock hypervisor (QHEE) then started the core and
+served set_remote_state and mem_protect_video_var. With Linux at EL2 these do what it did, recovered from its
+MMIO trace: the address ranges, the secure-SID setup, then the Venus CPU out of reset (only with
+"mothership,el2-video-start" in the Venus node); and the no-TZ boot (upstream vpu-1.0 firmware through the
+video-firmware subnode). See ports/nio/docs/video.md.
+
+---
+diff --git a/drivers/media/platform/qcom/venus/firmware.c b/drivers/media/platform/qcom/venus/firmware.c
+index af0ac40..3beaf30 100644
+--- a/drivers/media/platform/qcom/venus/firmware.c
++++ b/drivers/media/platform/qcom/venus/firmware.c
+@@ -3,6 +3,10 @@
+  * Copyright (C) 2017 Linaro Ltd.
+  */
+ 
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
+ #include <linux/device.h>
+ #include <linux/firmware.h>
+ #include <linux/kernel.h>
+@@ -22,6 +26,174 @@
+ #include "hfi_venus_io.h"
+ 
+ #define VENUS_PAS_ID			9
++
++/*
++ * mothershipOS: Venus at EL2 without the stock hypervisor (Qualcomm QHEE). TZ's auth_and_reset only authenticates
++ * the firmware; QHEE then started the core (its video_init_and_start), and it, not TZ, served the
++ * set_remote_state and mem_protect_video_var calls. With Linux at EL2 there is no QHEE: these do what it did,
++ * recovered by tracing its MMIO (stock nio hyp, video_bring_up 0x8004fd40, video_set_state 0x8005013c):
++ * the address ranges, the secure-SID setup (SEC_SID_1 and SEC_SID_7 secure: the firmware's own streams), then
++ * the XTSS (Venus CPU) out of reset. Only with "mothership,el2-video-start" in the Venus node.
++ */
++#define EL2_TZ_SEC_SID			0x2000		/* from wrapper_tz_base */
++
++/* bring-up aid: stop the EL2 start after step N (1 = TZ auth only, 2 = + ranges, 3 = + secure SIDs, 0 = all) */
++static int mship_el2_stop;
++module_param(mship_el2_stop, int, 0644);
++
++/* bring-up aid, no-TZ boot: stop after step N (1 = firmware device attached, 2 = + firmware loaded,
++ * 3 = + mapped and ranges written, 0 = all: the CPU out of reset) */
++static int mship_notz_stop = -1;
++module_param(mship_notz_stop, int, 0644);
++
++static void venus_el2_step(struct venus_core *core, const char *what)
++{
++	dev_info(core->dev, "el2: %s\n", what);
++	msleep(300);		/* let the log reach storage before the next step (a wrong step resets the SoC) */
++}
++
++static bool venus_el2(struct venus_core *core)
++{
++	return of_property_read_bool(core->dev->of_node, "mothership,el2-video-start");
++}
++
++static void venus_el2_ranges(struct venus_core *core)
++{
++	void __iomem *tz = core->wrapper_tz_base;
++	u32 fw_end = core->fw.mapped_mem_size;
++
++	writel(0, tz + WRAPPER_FW_START_ADDR);
++	writel(fw_end, tz + WRAPPER_FW_END_ADDR);
++	writel(0, tz + WRAPPER_CPA_START_ADDR);
++	writel(fw_end, tz + WRAPPER_CPA_END_ADDR);
++	if ((readl(core->base + 0xb0000) >> 17) >= 0x801) {
++		writel(0, tz + WRAPPER_NONPIX_START_ADDR);
++		writel(0, tz + WRAPPER_NONPIX_END_ADDR);
++	}
++}
++
++/*
++ * bring-up aid: QHEE wrote the sec-SID block (wrapper_tz_base + 0x2000) with the whole Venus wrapper live. The
++ * range block at +0x1000 answers from the controller (MVS0C) power alone, but the +0x2000 block reads back 0
++ * unless the vcodec0 core (MVS0 genpd + vcodec0_core clock) is also on, as it is per-decode-session. Turn it on
++ * before touching sec-SID when mship_el2_vcodec is set.
++ */
++static int mship_el2_ahb;
++module_param(mship_el2_ahb, int, 0644);
++static int mship_el2_scm;
++module_param(mship_el2_scm, int, 0644);
++static int mship_el2_vcodec;
++module_param(mship_el2_vcodec, int, 0644);
++static int mship_el2_hold;
++module_param(mship_el2_hold, int, 0644);
++
++static void venus_el2_vcodec_on(struct venus_core *core)
++{
++	int ret;
++
++	if (!core->pmdomains || core->pmdomains->num_pds < 2) {
++		dev_warn(core->dev, "el2: no vcodec0 pmdomain\n");
++		return;
++	}
++	ret = pm_runtime_get_sync(core->pmdomains->pd_devs[1]);	/* vcodec0 = MVS0 GDSC */
++	dev_info(core->dev, "el2: vcodec0 genpd get -> %d\n", ret);
++	ret = clk_prepare_enable(core->vcodec0_clks[0]);	/* vcodec0_core */
++	dev_info(core->dev, "el2: vcodec0_core clk -> %d\n", ret);
++}
++
++/* the GCC video AHB register-interface clocks (cvp_ahb, vcodec_ahb from the test overlay): the sec-SID bank at
++ * wrapper_tz_base + 0x2000 is a vcodec register bank reached over vcodec_ahb, which the upstream driver never
++ * enables. Turn them on before touching sec-SID when mship_el2_ahb is set. */
++static void venus_el2_ahb_on(struct venus_core *core)
++{
++	static const char * const names[] = { "cvp_ahb", "vcodec_ahb" };
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct clk *c = devm_clk_get(core->dev, names[i]);
++
++		if (IS_ERR(c)) {
++			dev_warn(core->dev, "el2: clk %s -> %ld\n", names[i], PTR_ERR(c));
++			continue;
++		}
++		ret = clk_prepare_enable(c);
++		dev_info(core->dev, "el2: %s enable -> %d\n", names[i], ret);
++	}
++}
++
++static void venus_el2_sec_sid(struct venus_core *core)
++{
++	void __iomem *b = core->wrapper_tz_base + EL2_TZ_SEC_SID;
++	int i;
++
++	writel(0, b + 0x90);
++	for (i = 0x40; i <= 0x7c; i += 4)
++		writel(0, b + i);
++	writel(0x3, b + 0x24);
++	writel(0x540, b + 0x04);
++	writel(0x10e, b + 0x08);
++	writel(0x2e, b + 0x0c);
++	writel(0xed8, b + 0x18);
++	writel(0x3138, b + 0x1c);
++	writel(0x640, b + 0x20);
++	writel(0, b + 0x98);
++	writel(0, b + 0x9c);
++	writel(1, b + 0x7c);
++	writel(1, b + 0x44);
++	if (!(readl(b + 0x44) & 1))
++		dev_err(core->dev, "el2: SEC_SID_1 not set (%#x)\n", readl(b + 0x44));
++	writel(1, b + 0x5c);
++	if (!(readl(b + 0x5c) & 1))
++		dev_err(core->dev, "el2: SEC_SID_7 not set (%#x)\n", readl(b + 0x5c));
++}
++
++/* QHEE video_set_state: 1 = start (ranges, secure SIDs, out of reset), 0 = hold in reset */
++static void venus_el2_set_state(struct venus_core *core, bool run)
++{
++	void __iomem *rst = core->wrapper_tz_base + WRAPPER_TZ_XTSS_SW_RESET;
++
++	if (!run) {
++		writel(WRAPPER_XTSS_SW_RESET_BIT, rst);
++		return;
++	}
++	if (!(readl(rst) & WRAPPER_XTSS_SW_RESET_BIT))
++		dev_warn(core->dev, "el2: XTSS not halted before start\n");
++	if (mship_el2_stop == 1)
++		return;
++	venus_el2_step(core, "ranges");
++	venus_el2_ranges(core);
++	if (mship_el2_stop == 2)
++		return;
++	if (mship_el2_vcodec)
++		venus_el2_vcodec_on(core);
++	if (mship_el2_ahb)
++		venus_el2_ahb_on(core);
++	venus_el2_step(core, "secure SIDs");
++	venus_el2_sec_sid(core);
++	{
++		void __iomem *tz = core->wrapper_tz_base;
++		void __iomem *b = tz + EL2_TZ_SEC_SID;
++
++		dev_info(core->dev, "el2: hw version %#x, ranges fw %#x-%#x cpa %#x-%#x nonpix %#x-%#x\n",
++			 readl(core->base + 0xb0000),
++			 readl(tz + WRAPPER_FW_START_ADDR), readl(tz + WRAPPER_FW_END_ADDR),
++			 readl(tz + WRAPPER_CPA_START_ADDR), readl(tz + WRAPPER_CPA_END_ADDR),
++			 readl(tz + WRAPPER_NONPIX_START_ADDR), readl(tz + WRAPPER_NONPIX_END_ADDR));
++		dev_info(core->dev, "el2: sec block 04 %#x 08 %#x 0c %#x 18 %#x 1c %#x 20 %#x 24 %#x 44 %#x 5c %#x 7c %#x\n",
++			 readl(b + 0x04), readl(b + 0x08), readl(b + 0x0c), readl(b + 0x18), readl(b + 0x1c),
++			 readl(b + 0x20), readl(b + 0x24), readl(b + 0x44), readl(b + 0x5c), readl(b + 0x7c));
++	}
++	if (mship_el2_stop == 3) {
++		/* bring-up aid: keep everything powered (core still in reset) for live register probing over devmem */
++		if (mship_el2_hold) {
++			dev_info(core->dev, "el2: holding %d s for probing\n", mship_el2_hold);
++			msleep(mship_el2_hold * 1000);
++		}
++		return;
++	}
++	venus_el2_step(core, "XTSS out of reset");
++	writel(0, rst);
++}
+ #define VENUS_FW_MEM_SIZE		(6 * SZ_1M)
+ #define VENUS_FW_START_ADDR		0x0
+ 
+@@ -58,6 +230,11 @@ int venus_set_hw_state(struct venus_core *core, bool resume)
+ {
+ 	int ret;
+ 
++	if (core->use_tz && venus_el2(core)) {
++		venus_el2_set_state(core, resume);
++		return 0;
++	}
++
+ 	if (core->use_tz) {
+ 		ret = qcom_scm_set_remote_state(resume, 0);
+ 		if (resume && ret == -EINVAL)
+@@ -116,6 +293,8 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
+ 		ret = fw_size;
+ 		goto err_release_fw;
+ 	}
++	if (core->use_tz && venus_el2(core))
++		core->fw.mapped_mem_size = ALIGN(fw_size, SZ_4K);	/* the firmware range (QHEE: end of the image) */
+ 
+ 	*mem_phys = rmem->base;
+ 	*mem_size = rmem->size;
+@@ -145,6 +324,63 @@ static int venus_load_fw(struct venus_core *core, const char *fwname,
+ 	return ret;
+ }
+ 
++/*
++ * bring-up aid, no-TZ boot: release the CPU and watch it for up to 200 ms; on the first SMMU fault (a context fault
++ * on the firmware's domain, or a global one: an unmatched stream) put it straight back into reset and report.
++ */
++static atomic_t notz_fault;
++static unsigned long notz_iova;
++static int notz_flags;
++
++static int venus_notz_fault(struct iommu_domain *d, struct device *dev, unsigned long iova, int flags, void *tok)
++{
++	struct venus_core *core = tok;
++
++	writel(WRAPPER_XTSS_SW_RESET_BIT, core->wrapper_tz_base + WRAPPER_TZ_XTSS_SW_RESET);
++	if (!atomic_xchg(&notz_fault, 1)) {
++		notz_iova = iova;
++		notz_flags = flags;
++	}
++	return 0;
++}
++
++static int venus_notz_watch(struct venus_core *core)
++{
++	void __iomem *rst = core->wrapper_tz_base + WRAPPER_TZ_XTSS_SW_RESET;
++	void __iomem *smmu = ioremap(0x15000000, SZ_4K);	/* apps SMMU GR0 */
++	u32 gfsr = 0, syn0 = 0, syn1 = 0, syn2 = 0;
++	int i;
++
++	if (!smmu)
++		return -ENOMEM;
++	atomic_set(&notz_fault, 0);
++	iommu_set_fault_handler(core->fw.iommu_domain, venus_notz_fault, core);
++	dev_info(core->dev, "notz: gfsr before %#x; releasing the CPU, watching\n", readl(smmu + 0x48));
++	msleep(300);
++	venus_reset_cpu(core);
++	for (i = 0; i < 200000 && !atomic_read(&notz_fault); i++) {
++		gfsr = readl_relaxed(smmu + 0x48);
++		if (gfsr) {
++			writel(WRAPPER_XTSS_SW_RESET_BIT, rst);
++			syn0 = readl(smmu + 0x50);
++			syn1 = readl(smmu + 0x54);
++			syn2 = readl(smmu + 0x58);
++			break;
++		}
++		udelay(1);
++	}
++	writel(WRAPPER_XTSS_SW_RESET_BIT, rst);		/* halted again either way, for this test */
++	dev_info(core->dev, "notz: after %d us: gfsr %#x syn0 %#x syn1 %#x (sid %#x) syn2 %#x; ctx fault %d iova %#lx flags %#x\n",
++		 i, gfsr, syn0, syn1, syn1 & 0xffff, syn2, atomic_read(&notz_fault), notz_iova, notz_flags);
++	dev_info(core->dev, "notz: SCIACMDARG0 %#x ARG1 %#x ARG2 %#x, wrapper intr %#x, tz cpu status %#x\n",
++		 readl(core->cpu_cs_base + CPU_CS_SCIACMDARG0), readl(core->cpu_cs_base + CPU_CS_SCIACMDARG1),
++		 readl(core->cpu_cs_base + CPU_CS_SCIACMDARG2), readl(core->wrapper_base + WRAPPER_INTR_STATUS),
++		 readl(core->wrapper_tz_base + WRAPPER_TZ_CPU_STATUS_V6));
++	iommu_set_fault_handler(core->fw.iommu_domain, NULL, NULL);
++	iounmap(smmu);
++	return -EAGAIN;
++}
++
+ static int venus_boot_no_tz(struct venus_core *core, phys_addr_t mem_phys,
+ 			    size_t mem_size)
+ {
+@@ -159,6 +395,9 @@ static int venus_boot_no_tz(struct venus_core *core, phys_addr_t mem_phys,
+ 	iommu = core->fw.iommu_domain;
+ 	core->fw.mapped_mem_size = mem_size;
+ 
++	if (mship_notz_stop == 2)
++		return -EAGAIN;
++	venus_el2_step(core, "notz: map the firmware");
+ 	ret = iommu_map(iommu, VENUS_FW_START_ADDR, mem_phys, mem_size,
+ 			IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV, GFP_KERNEL);
+ 	if (ret) {
+@@ -166,6 +405,23 @@ static int venus_boot_no_tz(struct venus_core *core, phys_addr_t mem_phys,
+ 		return ret;
+ 	}
+ 
++	if (mship_notz_stop == 3) {
++		u32 fw_size = core->fw.mapped_mem_size;
++		void __iomem *tz = core->wrapper_tz_base;
++
++		writel(0, tz + WRAPPER_FW_START_ADDR);
++		writel(fw_size, tz + WRAPPER_FW_END_ADDR);
++		writel(0, tz + WRAPPER_CPA_START_ADDR);
++		writel(fw_size, tz + WRAPPER_CPA_END_ADDR);
++		writel(fw_size, tz + WRAPPER_NONPIX_START_ADDR);
++		writel(fw_size, tz + WRAPPER_NONPIX_END_ADDR);
++		dev_info(dev, "notz: mapped %#zx, ranges written, XTSS reset reg %#x; stopping\n", mem_size,
++			 readl(tz + WRAPPER_TZ_XTSS_SW_RESET));
++		return -EAGAIN;
++	}
++	if (mship_notz_stop == 4)
++		return venus_notz_watch(core);
++	venus_el2_step(core, "notz: XTSS out of reset");
+ 	venus_reset_cpu(core);
+ 
+ 	return 0;
+@@ -235,6 +491,11 @@ int venus_boot(struct venus_core *core)
+ 	if (ret)
+ 		fwpath = core->res->fwname;
+ 
++	if (!core->use_tz) {
++		if (mship_notz_stop == 1)
++			return -EAGAIN;
++		venus_el2_step(core, "notz: load the firmware");
++	}
+ 	ret = venus_load_fw(core, fwpath, &mem_phys, &mem_size);
+ 	if (ret) {
+ 		dev_err(dev, "fail to load video firmware\n");
+@@ -244,15 +505,65 @@ int venus_boot(struct venus_core *core)
+ 	core->fw.mem_size = mem_size;
+ 	core->fw.mem_phys = mem_phys;
+ 
+-	if (core->use_tz)
++	if (core->use_tz) {
++		if (venus_el2(core) && mship_el2_hold < 0) {
++			/* bring-up aid: powered, firmware in memory, TZ not yet asked to authenticate */
++			dev_info(core->dev, "el2: pre-auth holding %d s for probing\n", -mship_el2_hold);
++			msleep(-mship_el2_hold * 1000);
++		}
++		if (venus_el2(core))
++			venus_el2_step(core, "TZ auth_and_reset");
+ 		ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
+-	else
++		if (venus_el2(core))
++			dev_info(dev, "el2: auth_and_reset -> %d, XTSS reset reg %#x\n", ret,
++				 readl(core->wrapper_tz_base + WRAPPER_TZ_XTSS_SW_RESET));
++		if (!ret && venus_el2(core)) {
++			void __iomem *tz = core->wrapper_tz_base;
++			void __iomem *b = tz + EL2_TZ_SEC_SID;
++
++			dev_info(dev, "el2: post-auth, BEFORE any write: ranges fw %#x-%#x cpa %#x-%#x; sec 04 %#x 24 %#x 44 %#x 5c %#x\n",
++				 readl(tz + WRAPPER_FW_START_ADDR), readl(tz + WRAPPER_FW_END_ADDR),
++				 readl(tz + WRAPPER_CPA_START_ADDR), readl(tz + WRAPPER_CPA_END_ADDR),
++				 readl(b + 0x04), readl(b + 0x24), readl(b + 0x44), readl(b + 0x5c));
++			if (mship_el2_scm == 1) {
++				int r1 = qcom_scm_set_remote_state(1, 0);
++				int r2 = qcom_scm_set_remote_state(1, VENUS_PAS_ID);
++
++				dev_info(dev, "el2: scm set_remote_state(1,0)->%d (1,9)->%d; sec 44 %#x 5c %#x\n",
++					 r1, r2, readl(b + 0x44), readl(b + 0x5c));
++			}
++			if (mship_el2_scm == 2) {
++				/* mainline SCM path for video CP/sec config: probe cp_size (= venus_ns pool base) candidates;
++				 * non-pixel (0x1000000, 0x24800000) matches sc7180/sdm845. Core stays in reset (safe). */
++				static const u32 cand[] = { 0x70800000, 0x25800000, 0x29000000, 0x4b000000, 0x79000000, 0 };
++				int i, rv;
++
++				dev_info(dev, "el2: restore_sec_cfg_avail=%d\n", qcom_scm_restore_sec_cfg_available());
++				for (i = 0; i < ARRAY_SIZE(cand); i++) {
++					rv = qcom_scm_mem_protect_video_var(0, cand[i], 0x1000000, 0x24800000);
++					dev_info(dev, "el2: video_var(cp_size=%#x)->%d; sec 44 %#x 5c %#x\n",
++						 cand[i], rv, readl(b + 0x44), readl(b + 0x5c));
++				}
++			}
++			dev_info(dev, "el2: starting the core (fw range %#zx)\n", core->fw.mapped_mem_size);
++			venus_el2_set_state(core, true);
++		}
++	} else
+ 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
+ 
+ 	if (ret)
+ 		return ret;
+ 
+-	if (core->use_tz && res->cp_size) {
++	if (core->use_tz && res->cp_size && venus_el2(core)) {
++		/* QHEE video_set_va_ranges: CPA [0, cp_size), non-pixel [start, start + size) */
++		writel(0, core->wrapper_tz_base + WRAPPER_CPA_START_ADDR);
++		writel(res->cp_size, core->wrapper_tz_base + WRAPPER_CPA_END_ADDR);
++		if ((readl(core->base + 0xb0000) >> 17) >= 0x801) {
++			writel(res->cp_nonpixel_start, core->wrapper_tz_base + WRAPPER_NONPIX_START_ADDR);
++			writel(res->cp_nonpixel_start + res->cp_nonpixel_size,
++			       core->wrapper_tz_base + WRAPPER_NONPIX_END_ADDR);
++		}
++	} else if (core->use_tz && res->cp_size) {
+ 		/*
+ 		 * Clues for porting using downstream data:
+ 		 * cp_start = 0
+@@ -282,6 +593,8 @@ int venus_shutdown(struct venus_core *core)
+ {
+ 	int ret;
+ 
++	if (core->use_tz && venus_el2(core))
++		venus_el2_set_state(core, false);	/* QHEE video tear_down */
+ 	if (core->use_tz)
+ 		ret = qcom_scm_pas_shutdown(VENUS_PAS_ID);
+ 	else
+@@ -360,6 +673,7 @@ int venus_firmware_init(struct venus_core *core)
+ 	}
+ 
+ 	core->fw.iommu_domain = iommu_dom;
++	dev_info(core->dev, "notz: firmware device attached\n");
+ 
+ 	of_node_put(np);
+ 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the PM8150 power key interrupt armed (mothershipOS workaround)
+After=systemd-udev-settle.service systemd-modules-load.service sys-kernel-debug.mount
+Requires=sys-kernel-debug.mount
+
+[Service]
+ExecStart=/usr/local/sbin/mship-system pwrkey-rearm watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

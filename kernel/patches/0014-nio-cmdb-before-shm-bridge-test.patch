@@ -1,0 +1,114 @@
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -1722,6 +1722,91 @@
+  * the SHM Bridge is enabled, the SCM is not yet fully set up and doesn't
+  * accept global user calls. Don't try to use the __scm pointer here.
+  */
++/* Diagnostic only: reproduce the approved RO assignment/restoration before
++ * enabling SHM-bridge enforcement. No firmware bytes or other regions touched.
++ */
++static u64 nio_cmdb_early_bridge;
++static bool nio_cmdb_early_bridge_available;
++
++int qcom_scm_nio_cmdb_test_take_bridge(u64 *handle)
++{
++	if (!xchg(&nio_cmdb_early_bridge_available, false))
++		return -ENOENT;
++	*handle = nio_cmdb_early_bridge;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_scm_nio_cmdb_test_take_bridge);
++
++static void nio_cmdb_before_bridge_test(struct device *dev)
++{
++	struct device_node *node;
++	struct resource cmd;
++	struct arm_smccc_res result;
++	void *buf;
++	dma_addr_t pa;
++	__le32 *src, *dest;
++	__le64 *region, *extra;
++	static bool attempted;
++	int ret;
++	struct qcom_scm_desc bridge_desc = {
++		.svc = QCOM_SCM_SVC_MP, .cmd = QCOM_SCM_MP_SHM_BRIDGE_CREATE,
++		.arginfo = QCOM_SCM_ARGS(4), .owner = ARM_SMCCC_OWNER_SIP,
++	};
++	struct qcom_scm_res bridge_result = {};
++
++	if (attempted || !is_kernel_in_hyp_mode() ||
++	    !of_property_read_bool(dev->of_node, "mothership,el2-cmdb-before-bridge-test"))
++		return;
++	attempted = true;
++	node = of_find_compatible_node(NULL, NULL, "qcom,cmd-db");
++	if (!node) { dev_err(dev, "nio early CMD-DB: missing resource\n"); return; }
++	ret = of_address_to_resource(node, 0, &cmd);
++	of_node_put(node);
++	if (ret || cmd.start != 0x80860000 || resource_size(&cmd) != 0x20000) {
++		dev_err(dev, "nio early CMD-DB: rejected unexpected bounds\n"); return;
++	}
++	buf = dma_alloc_coherent(dev, PAGE_SIZE, &pa, GFP_KERNEL);
++	if (!buf) { dev_err(dev, "nio early CMD-DB: allocation failed\n"); return; }
++	memset(buf, 0, PAGE_SIZE);
++	src = buf; region = buf + 64; dest = buf + 128; extra = buf + 192;
++	src[0] = cpu_to_le32(3);
++	region[0] = cpu_to_le64(cmd.start); region[1] = cpu_to_le64(resource_size(&cmd));
++	dest[0] = cpu_to_le32(3); dest[1] = cpu_to_le32(4);
++	dest[6] = cpu_to_le32(6); dest[7] = cpu_to_le32(4);
++	extra[0] = cpu_to_le64(4); extra[1] = cpu_to_le64(pa + 128);
++	extra[2] = cpu_to_le64(48);
++	wmb();
++	arm_smccc_smc(0xc2000c16, 0x1117, pa+64, 16, pa, pa+192, 0, 3, &result);
++	dev_info(dev, "nio early CMD-DB: RO share a0=%#lx a1=%#lx\n", result.a0, result.a1);
++	if (!result.a0 && !result.a1) {
++		src[1] = cpu_to_le32(6);
++		memset(dest, 0, 48); dest[0] = cpu_to_le32(3); dest[1] = cpu_to_le32(4);
++		extra[0] = cpu_to_le64(8); extra[2] = cpu_to_le64(24);
++		wmb();
++		arm_smccc_smc(0xc2000c16, 0x1117, pa+64, 16, pa, pa+192, 0, 3, &result);
++		dev_info(dev, "nio early CMD-DB: HLOS RO restore a0=%#lx a1=%#lx\n", result.a0, result.a1);
++		if (result.a0 || result.a1)
++			dev_err(dev, "nio early CMD-DB: restore failed; use original boot image and reboot\n");
++	}
++	dma_free_coherent(dev, PAGE_SIZE, buf, pa);
++	/* Only register after both earlier ownership transitions succeeded. */
++	if (!result.a0 && !result.a1 &&
++	    of_property_read_bool(dev->of_node, "mothership,el2-cmdb-early-ro-bridge-test")) {
++		bridge_desc.args[0] = cmd.start | 4;
++		bridge_desc.args[1] = cmd.start | 4;
++		bridge_desc.args[2] = resource_size(&cmd) | BIT(9);
++		bridge_desc.args[3] = 3;
++		ret = qcom_scm_call(dev, &bridge_desc, &bridge_result);
++		dev_info(dev, "nio early CMD-DB: RO bridge ret=%d status=%#llx\n", ret, bridge_result.result[0]);
++		if (!ret && !bridge_result.result[0]) {
++			nio_cmdb_early_bridge = bridge_result.result[1];
++			smp_wmb();
++			nio_cmdb_early_bridge_available = true;
++			dev_info(dev, "nio early CMD-DB: HLOS+secure RO bridge reserved for bounded ADSP test\n");
++		}
++	}
++}
++
+ int qcom_scm_shm_bridge_enable(struct device *scm_dev)
+ {
+ 	int ret;
+@@ -1733,6 +1818,8 @@
+ 	};
+ 
+ 	struct qcom_scm_res res;
++
++	nio_cmdb_before_bridge_test(scm_dev);
+ 
+ 	if (!__qcom_scm_is_call_available(scm_dev, QCOM_SCM_SVC_MP,
+ 					  QCOM_SCM_MP_SHM_BRIDGE_ENABLE))
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -10,6 +10,8 @@
+ #include <linux/cpumask.h>
+ 
+ #include <dt-bindings/firmware/qcom,scm.h>
++
++int qcom_scm_nio_cmdb_test_take_bridge(u64 *handle);
+ 
+ #define QCOM_SCM_VERSION(major, minor)	(((major) << 16) | ((minor) & 0xFF))
+ #define QCOM_SCM_CPU_PWR_DOWN_L2_ON	0x0

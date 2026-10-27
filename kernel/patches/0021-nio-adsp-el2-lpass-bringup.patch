@@ -1,0 +1,491 @@
+From: mothershipOS
+Subject: [PATCH] nio: boot the ADSP at EL2 without QHEE (LPASS bring-up, SID 0x1800, CMD-DB share)
+
+On stock nio, QHEE intercepts the ADSP PAS auth_and_reset (pil_auth_reset_api_ns) and runs
+PILSubsys_memAssign -> TZ auth -> PILSubsys_bringUp. TZ alone only authenticates; the hypervisor
+clocks the LPASS Q6 and releases it (QHEE hyp-code: lpass_bring_up = ClockSetup(0) + RST_EVB +
+ClockEnable(0), recovered by disassembly + unicorn MMIO trace, see ports/nio/docs/audio.md).
+
+- qcom_q6v5_pas: port of QHEE's LPASS bring-up after auth_and_reset (pas_id 1, EL2 only, and only
+  when the DT provides the identity SMMU domain and the CMD-DB share; otherwise the Q6 would reset
+  the SoC at every boot). Boot vector = mem_phys (image is not relocatable; mem_reloc is its link
+  address 0x89500000, which crashes the SoC).
+- arm-smmu-qcom: identity domain for qcom,sm8250-adsp-pas (Q6 fetches as apps SMMU SID 0x1800,
+  previously a QHEE stage-2 context; blocked unmatched stream -> SoC reset).
+- qcom_scm: DT property mothership,el2-cmdb-share-adsp (or qcom_scm.nio_cmdb_share_adsp=1) enables the
+  early, kept HLOS+ADSP read-only CMD-DB assignment before SHM bridge enable (TZ rejects it after).
+  Generated from the tree the running kernel was built from (it replaces 0016, which no longer applied).
+
+---
+diff --git a/drivers/firmware/qcom/qcom_scm-smc.c b/drivers/firmware/qcom/qcom_scm-smc.c
+index 0c6b95c..6da710a 100644
+--- a/drivers/firmware/qcom/qcom_scm-smc.c
++++ b/drivers/firmware/qcom/qcom_scm-smc.c
+@@ -235,6 +235,12 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
+ 	if (ret)
+ 		return ret;
+ 
++	/* mothershipOS debug: raw TZ result of MEM_ASSIGN (svc 0x0c cmd 0x16) */
++	if ((smc.args[0] & 0xffff) == 0x0c16)
++		pr_info("qcom_scm: MEM_ASSIGN fid %#lx arginfo %#lx x2..x5 %#lx %#lx %#lx %#lx -> a0 %#lx a1 %#lx a2 %#lx a3 %#lx\n",
++			smc.args[0], smc.args[1], smc.args[2], smc.args[3], smc.args[4], smc.args[5],
++			smc_res.a0, smc_res.a1, smc_res.a2, smc_res.a3);
++
+ 	if (res) {
+ 		res->result[0] = smc_res.a1;
+ 		res->result[1] = smc_res.a2;
+diff --git a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
+index 6ea8582..944d845 100644
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -1725,6 +1725,23 @@ EXPORT_SYMBOL_GPL(qcom_scm_lmh_dcvsh_available);
+ /* Diagnostic only: reproduce the approved RO assignment/restoration before
+  * enabling SHM-bridge enforcement. No firmware bytes or other regions touched.
+  */
++/* mothershipOS: EL2 replacement for QHEE's boot-time CMD-DB sharing with the ADSP (HLOS+ADSP RO,
++ * kept), selectable on the kernel command line so it can be kexec-tested with the running DT. */
++static bool nio_cmdb_share_adsp;
++module_param(nio_cmdb_share_adsp, bool, 0400);
++MODULE_PARM_DESC(nio_cmdb_share_adsp, "EL2: share CMD-DB read-only with the ADSP before SHM bridge enable");
++
++static bool nio_cmdb_early_owners_available;
++
++int qcom_scm_nio_cmdb_test_take_owners(u64 *owners)
++{
++	if (!xchg(&nio_cmdb_early_owners_available, false))
++		return -ENOENT;
++	*owners = BIT_ULL(3) | BIT_ULL(6);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_scm_nio_cmdb_test_take_owners);
++
+ static u64 nio_cmdb_early_bridge;
+ static bool nio_cmdb_early_bridge_available;
+ 
+@@ -1754,8 +1771,10 @@ static void nio_cmdb_before_bridge_test(struct device *dev)
+ 	};
+ 	struct qcom_scm_res bridge_result = {};
+ 
+-	if (attempted || !is_kernel_in_hyp_mode() ||
+-	    !of_property_read_bool(dev->of_node, "mothership,el2-cmdb-before-bridge-test"))
++	if (of_property_read_bool(dev->of_node, "mothership,el2-cmdb-share-adsp"))
++		nio_cmdb_share_adsp = true;
++	if (attempted || !is_kernel_in_hyp_mode() || (!nio_cmdb_share_adsp &&
++	    !of_property_read_bool(dev->of_node, "mothership,el2-cmdb-before-bridge-test")))
+ 		return;
+ 	attempted = true;
+ 	node = of_find_compatible_node(NULL, NULL, "qcom,cmd-db");
+@@ -1778,6 +1797,13 @@ static void nio_cmdb_before_bridge_test(struct device *dev)
+ 	wmb();
+ 	arm_smccc_smc(0xc2000c16, 0x1117, pa+64, 16, pa, pa+192, 0, 3, &result);
+ 	dev_info(dev, "nio early CMD-DB: RO share a0=%#lx a1=%#lx\n", result.a0, result.a1);
++	if (!result.a0 && !result.a1 && (nio_cmdb_share_adsp ||
++	    of_property_read_bool(dev->of_node, "mothership,el2-cmdb-hold-for-adsp-test"))) {
++		WRITE_ONCE(nio_cmdb_early_owners_available, true);
++		dev_info(dev, "nio early CMD-DB: shared read-only with HLOS+ADSP\n");
++		dma_free_coherent(dev, PAGE_SIZE, buf, pa);
++		return;
++	}
+ 	if (!result.a0 && !result.a1) {
+ 		src[1] = cpu_to_le32(6);
+ 		memset(dest, 0, 48); dest[0] = cpu_to_le32(3); dest[1] = cpu_to_le32(4);
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+index f7cb7de..51a8d1a 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -394,6 +394,8 @@ static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
+ 	{ .compatible = "qcom,sm6375-mdss" },
+ 	{ .compatible = "qcom,sm8150-mdss" },
+ 	{ .compatible = "qcom,sm8250-mdss" },
++	/* mothershipOS: EL2 without QHEE, the LPASS Q6 (SID 0x1800) fetches through this SMMU */
++	{ .compatible = "qcom,sm8250-adsp-pas" },
+ 	{ .compatible = "qcom,x1e80100-mdss" },
+ 	{ }
+ };
+diff --git a/drivers/remoteproc/qcom_q6v5_pas.c b/drivers/remoteproc/qcom_q6v5_pas.c
+index 8eb0db5..3ac643b 100644
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -7,12 +7,13 @@
+  * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+  */
+ 
+-#include <linux/arm-smccc.h>
+-#include <linux/dma-mapping.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -35,22 +36,122 @@
+ 
+ #include <asm/virt.h>
+ 
+-/* Diagnostic only: disabled unless root explicitly opts in at runtime. */
+-static bool nio_el2_cmdb_early_bridge;
+-module_param(nio_el2_cmdb_early_bridge, bool, 0600);
+-MODULE_PARM_DESC(nio_el2_cmdb_early_bridge, "Consume early HLOS-only RO bridge for bounded CMD-DB test");
++/*
++ * mothershipOS: with Linux at EL2 there is no QHEE. On stock nio, QHEE handles the ADSP
++ * auth_and_reset call (pil_auth_reset_api_ns) as memAssign -> TZ auth -> PILSubsys_bringUp, and
++ * bringUp is what actually clocks and starts the LPASS Q6: TZ alone authenticates but leaves the
++ * core stopped. Port of QHEE's LPASS bringUp (ClockSetup(0), boot vector, ClockEnable(0)).
++ * QHEE's other duties are in the DT: CMD-DB/SMEM sharing (qcom_scm) and SID 0x1800 (apps SMMU).
++ */
++static bool nio_lpass_bringup = true;
++module_param(nio_lpass_bringup, bool, 0600);
++MODULE_PARM_DESC(nio_lpass_bringup, "EL2: start the LPASS Q6 after TZ auth, as QHEE does");
+ 
+-static bool nio_el2_cmdb_start_test;
+-module_param(nio_el2_cmdb_start_test, bool, 0600);
+-MODULE_PARM_DESC(nio_el2_cmdb_start_test, "Explicitly approved CMD-DB RO sharing during bounded ADSP test only");
++#define NIO_Q6SS		0x03000000	/* QDSP6SS */
++#define NIO_LPASS_AON		0x03380000
++#define NIO_LPASS_CORE		0x03c00000
++#define NIO_LPASS_MEM		0x03555000
++#define NIO_LPASS_EFUSE		0x0355b000
++
++static void nio_rmw(void __iomem *r, u32 keep, u32 set)
++{
++	writel((readl(r) & keep) | set, r);
++}
+ 
+-static bool nio_el2_image_hyp_caller;
+-module_param(nio_el2_image_hyp_caller, bool, 0600);
+-MODULE_PARM_DESC(nio_el2_image_hyp_caller, "Use private VMID4-registered descriptors for bounded ADSP test");
++/* CBCR: enable unless under HW control, then wait for CLK_OFF (bit 31) to clear */
++static int nio_cbcr_on(void __iomem *r, u32 keep)
++{
++	u32 v;
+ 
+-static bool nio_el2_image_start_test;
+-module_param(nio_el2_image_start_test, bool, 0600);
+-MODULE_PARM_DESC(nio_el2_image_start_test, "Bounded nio ADSP image-sharing startup test; always shutdown and restore");
++	nio_rmw(r, keep, BIT(0));
++	if (readl(r) & BIT(1))
++		return 0;
++	return readl_poll_timeout_atomic(r, v, !(v & BIT(31)), 1, 500);
++}
++
++/*
++ * A running Q6 without QHEE's other duties resets the SoC (blocked SID 0x1800 fetches, CMD-DB access
++ * violation). Only start it when the DT provides both, so an older boot image just times out instead.
++ */
++static bool nio_lpass_prerequisites(struct device *dev)
++{
++	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
++	struct device_node *scm = of_find_node_by_path("/firmware/scm");
++	bool cmdb = scm && of_property_read_bool(scm, "mothership,el2-cmdb-share-adsp");
++
++	of_node_put(scm);
++	if (domain && domain->type == IOMMU_DOMAIN_IDENTITY && cmdb)
++		return true;
++	dev_warn(dev, "nio lpass: not starting Q6 (identity SMMU %d, CMD-DB share %d)\n",
++		 domain && domain->type == IOMMU_DOMAIN_IDENTITY, cmdb);
++	return false;
++}
++
++static int nio_lpass_bring_up(struct device *dev, phys_addr_t boot)
++{
++	void __iomem *q6ss, *aon, *core, *mem, *efuse;
++	u32 saved, v;
++	int ret = -ENOMEM;
++
++	q6ss = ioremap(NIO_Q6SS, 0x1000);
++	aon = ioremap(NIO_LPASS_AON, 0xb000);
++	core = ioremap(NIO_LPASS_CORE, 0x9000);
++	mem = ioremap(NIO_LPASS_MEM, 0x1000);
++	efuse = ioremap(NIO_LPASS_EFUSE, 0x10);
++	if (!q6ss || !aon || !core || !mem || !efuse)
++		goto out;
++
++	/* QHEE ClockSetup(LPASS) */
++	nio_rmw(core + 0x8000, 0x80000001, 0);
++	ret = nio_cbcr_on(aon + 0x901c, 0x80000006);
++	if (!ret)
++		ret = nio_cbcr_on(aon + 0x9020, 0x80000006);
++	if (ret) { dev_err(dev, "nio lpass: AON clocks: %d\n", ret); goto out; }
++	saved = readl(q6ss + 0x18);
++	nio_rmw(aon + 0x3090, 0xf8ffffff, 0xf000);
++	nio_rmw(core + 0x4000, 0x80000000, BIT(0));
++	readl(core + 0x4000);
++	ret = readl_poll_timeout_atomic(core + 0x4000, v, !(v & BIT(31)), 1, 500);
++	if (!ret)
++		ret = nio_cbcr_on(aon + 0x901c, 0x80000006);
++	if (!ret)
++		ret = nio_cbcr_on(aon + 0x9020, 0x80000006);
++	if (ret) { dev_err(dev, "nio lpass: core clock: %d\n", ret); goto out; }
++	nio_rmw(q6ss + 0x38, 0x80000000, BIT(0));	/* XO_CBCR */
++	nio_rmw(q6ss + 0x3c, 0x80000000, BIT(0));	/* SLEEP_CBCR */
++	nio_rmw(q6ss + 0x20, 0x80000000, BIT(0));	/* CORE_CBCR */
++	writel(saved & 0xffff0002, q6ss + 0x18);
++	if (saved & 0xffff0002) {
++		nio_rmw(aon + 0xa00c, 0x80007ff4, BIT(0));
++		nio_rmw(aon + 0xa014, 0x80000004, BIT(0));
++	}
++	nio_rmw(mem + 0x14, 0x3, 0x4);
++	nio_rmw(mem + 0x18, 0x3, 0x4);
++	nio_rmw(mem + 0x20, 0x3, 0x4);
++	if (readl_poll_timeout_atomic(mem + 0x20, v, v & BIT(0), 1, 1000))
++		dev_dbg(dev, "nio lpass: memory power status %#x\n", v);
++	nio_rmw(core + 0x8000, 0x80000001, BIT(1));
++
++	/* boot vector: RST_EVB[27:4] = boot[31:8], then select it in the LPASS efuse override */
++	nio_rmw(q6ss + 0x10, (u32)~GENMASK(27, 4), ((u32)boot >> 8) << 4);
++	nio_rmw(efuse, (u32)~BIT(0), 0);
++	dsb(sy);
++
++	/* QHEE ClockEnable(LPASS): CORE_START, BOOT_CMD, wait for BOOT_STATUS */
++	readl(q6ss + 0x400);
++	writel(1, q6ss + 0x400);
++	writel(1, q6ss + 0x404);
++	ret = readl_poll_timeout(q6ss + 0x408, v, v & BIT(0), 5, 1000000);
++	dev_info(dev, "nio lpass: boot %pa evb=%#x status=%#x saved18=%#x ret=%d\n",
++		 &boot, readl(q6ss + 0x10), v, saved, ret);
++out:
++	if (efuse) iounmap(efuse);
++	if (mem) iounmap(mem);
++	if (core) iounmap(core);
++	if (aon) iounmap(aon);
++	if (q6ss) iounmap(q6ss);
++	return ret;
++}
+ 
+ #define QCOM_PAS_DECRYPT_SHUTDOWN_DELAY_MS	100
+ 
+@@ -85,7 +186,6 @@ struct qcom_pas_data {
+ struct qcom_pas {
+ 	struct device *dev;
+ 	struct rproc *rproc;
+-	bool nio_image_retained;
+ 
+ 	struct qcom_q6v5 q6v5;
+ 
+@@ -245,9 +345,6 @@ static int qcom_pas_load(struct rproc *rproc, const struct firmware *fw)
+ 	struct qcom_pas *pas = rproc->priv;
+ 	int ret;
+ 
+-	if (pas->nio_image_retained)
+-		return -EBUSY; /* No image writes after uncertain shutdown/restoration. */
+-
+ 	/* Store firmware handle to be used in qcom_pas_start() */
+ 	pas->firmware = fw;
+ 
+@@ -287,170 +384,6 @@ static int qcom_pas_load(struct rproc *rproc, const struct firmware *fw)
+ 	return ret;
+ }
+ 
+-/* Diagnostic HYP-caller assignment. Only private descriptor storage is
+- * additionally shared with VMID4; the target remains the approved ADSP image.
+- */
+-static int nio_pas_hyp_assign(struct qcom_pas *pas, phys_addr_t base, size_t bytes,
+-			      u64 *owners,
+-			      struct qcom_scm_vmperm *dest, int count)
+-{
+-	struct qcom_scm_vmperm descriptor_shared[] = { {3, 6}, {4, 6} };
+-	struct qcom_scm_vmperm hlos = {3, 7};
+-	struct arm_smccc_res result;
+-	__le32 *src, *dst;
+-	__le64 *region, *extra;
+-	dma_addr_t pa;
+-	void *buf;
+-	u64 descriptor_owners = BIT(3), handle = 0, new_owners = 0;
+-	int ret, clean, i, n = 0;
+-	bool bridge = false, unsafe = false;
+-
+-	if (!((base == 0x8a100000 && bytes == 0x1d00000) ||
+-	      (base == 0x80860000 && bytes == 0x20000)))
+-		return -EINVAL;
+-	if (*owners & ~(BIT_ULL(3) | BIT_ULL(6)))
+-		return -EINVAL;
+-	buf = dma_alloc_coherent(pas->dev, PAGE_SIZE, &pa, GFP_KERNEL);
+-	if (!buf)
+-		return -ENOMEM;
+-	memset(buf, 0, PAGE_SIZE);
+-	src = buf; region = buf + 64; dst = buf + 128; extra = buf + 192;
+-	for (i = 0; i < 64; i++)
+-		if (*owners & BIT_ULL(i))
+-			src[n++] = cpu_to_le32(i);
+-	/* The bounded test only uses owners 3 and 6 and up to two destinations. */
+-	if (!n || n > 2 || count < 1 || count > 2) { ret = -EINVAL; goto out; }
+-	region[0] = cpu_to_le64(base);
+-	region[1] = cpu_to_le64(bytes);
+-	for (i = 0; i < count; i++) {
+-		dst[6*i] = cpu_to_le32(dest[i].vmid);
+-		dst[6*i+1] = cpu_to_le32(dest[i].perm);
+-		new_owners |= BIT_ULL(dest[i].vmid);
+-	}
+-	extra[0] = cpu_to_le64(4*n);
+-	extra[1] = cpu_to_le64(pa + 128);
+-	extra[2] = cpu_to_le64(24*count);
+-
+-	ret = qcom_scm_assign_mem(pa, PAGE_SIZE, &descriptor_owners,
+-				 descriptor_shared, 2);
+-	if (ret) goto out;
+-	ret = qcom_scm_shm_bridge_create(pa | 6, pa | 6,
+-					PAGE_SIZE | BIT(9), 4, &handle);
+-	if (ret) goto restore_descriptor;
+-	bridge = true;
+-	wmb();
+-	arm_smccc_smc(0xc2000c16, 0x1117, pa+64, 16, pa, pa+192, 0, 0, &result);
+-	dev_info(pas->dev, "nio HYP assign %pa+%#zx: a0=%#lx a1=%#lx\n", &base, bytes, result.a0, result.a1);
+-	ret = result.a0 || result.a1 ? -EIO : 0;
+-	if (!ret) *owners = new_owners;
+-restore_descriptor:
+-	if (bridge) {
+-		clean = qcom_scm_shm_bridge_delete(handle);
+-		dev_info(pas->dev, "nio HYP descriptor bridge delete=%d\n", clean);
+-		if (clean) unsafe = true;
+-	}
+-	clean = qcom_scm_assign_mem(pa, PAGE_SIZE, &descriptor_owners, &hlos, 1);
+-	dev_info(pas->dev, "nio HYP descriptor restore=%d\n", clean);
+-	if (clean) unsafe = true;
+-out:
+-	if (!unsafe)
+-		dma_free_coherent(pas->dev, PAGE_SIZE, buf, pa);
+-	else
+-		dev_err(pas->dev, "nio HYP descriptor page retained; reboot to clear private allocation\n");
+-	/* Never mask target success: the caller must still shutdown/restore it. */
+-	return ret;
+-}
+-
+-/* One bounded experiment, not a production ownership policy. Called with
+- * remoteproc serialization, after image loading and before authentication.
+- */
+-static int nio_pas_image_start_test(struct qcom_pas *pas)
+-{
+-	struct qcom_scm_vmperm shared[] = {{3, 6}, {6, 6}};
+-	struct qcom_scm_vmperm restored = {3, 7};
+-	struct qcom_scm_vmperm readers[] = {{3, 4}, {6, 4}}, cmd_hlos = {3, 4};
+-	u64 owners = BIT(3), cmd_owners = BIT(3), cmd_handle = 0;
+-	struct device_node *node;
+-	struct resource cmd;
+-	bool cmd_shared = false, cmd_bridge = false;
+-	int ret, shutdown, restore, cmd_restore;
+-
+-	if (!is_kernel_in_hyp_mode() || pas->pas_id != 1 ||
+-	    !of_device_is_compatible(pas->dev->of_node, "qcom,sm8250-adsp-pas") ||
+-	    pas->mem_phys != 0x8a100000 || pas->mem_size != 0x1d00000)
+-		return -EINVAL;
+-
+-	/* Separate permission scope, root-only and disabled by default. */
+-	if (nio_el2_cmdb_start_test) {
+-		if (!nio_el2_image_hyp_caller) return -EINVAL;
+-		node = of_find_compatible_node(NULL, NULL, "qcom,cmd-db");
+-		if (!node) return -ENODEV;
+-		ret = of_address_to_resource(node, 0, &cmd);
+-		of_node_put(node);
+-		if (ret || cmd.start != 0x80860000 || resource_size(&cmd) != 0x20000)
+-			return -EINVAL;
+-		/* Register target RO for HLOS before changing its NS access policy. */
+-		if (nio_el2_cmdb_early_bridge)
+-			ret = qcom_scm_nio_cmdb_test_take_bridge(&cmd_handle);
+-		else
+-			ret = qcom_scm_shm_bridge_create(cmd.start | 4, cmd.start | 4,
+-							resource_size(&cmd) | BIT(9), 3, &cmd_handle);
+-		dev_info(pas->dev, "nio image-start-test: CMD-DB RO bridge=%d\n", ret);
+-		if (ret) return ret < 0 ? ret : -EIO;
+-		cmd_bridge = true;
+-		ret = nio_pas_hyp_assign(pas, cmd.start, resource_size(&cmd),
+-					&cmd_owners, readers, 2);
+-		dev_info(pas->dev, "nio image-start-test: CMD-DB RO share=%d owners=%#llx\n", ret, cmd_owners);
+-		if (ret) goto restore_cmd;
+-		cmd_shared = true;
+-	}
+-
+-	if (nio_el2_image_hyp_caller)
+-		ret = nio_pas_hyp_assign(pas, pas->mem_phys, pas->mem_size, &owners, shared, 2);
+-	else
+-		ret = qcom_scm_assign_mem(pas->mem_phys, pas->mem_size, &owners, shared, 2);
+-	dev_info(pas->dev, "nio image-start-test: share=%d owners=%#llx\n", ret, owners);
+-	if (ret) goto restore_cmd;
+-	pas->nio_image_retained = true;
+-
+-	ret = qcom_scm_pas_auth_and_reset(pas->pas_id);
+-	dev_info(pas->dev, "nio image-start-test: auth=%d\n", ret);
+-	if (!ret) {
+-		ret = qcom_q6v5_wait_for_start(&pas->q6v5, msecs_to_jiffies(5000));
+-		dev_info(pas->dev, "nio image-start-test: ready=%d\n", ret);
+-	}
+-	shutdown = qcom_scm_pas_shutdown(pas->pas_id);
+-	dev_info(pas->dev, "nio image-start-test: shutdown=%d\n", shutdown);
+-	if (shutdown) {
+-		dev_err(pas->dev, "nio image-start-test: kept shared; reboot required\n");
+-		return shutdown;
+-	}
+-	if (nio_el2_image_hyp_caller)
+-		restore = nio_pas_hyp_assign(pas, pas->mem_phys, pas->mem_size, &owners, &restored, 1);
+-	else
+-		restore = qcom_scm_assign_mem(pas->mem_phys, pas->mem_size, &owners, &restored, 1);
+-	dev_info(pas->dev, "nio image-start-test: restore=%d owners=%#llx\n", restore, owners);
+-	if (restore) ret = restore;
+-	pas->nio_image_retained = !!restore;
+-restore_cmd:
+-	/* Shutdown succeeded or reset was never released. HLOS continues reading CMD-DB. */
+-	if (cmd_shared) {
+-		cmd_restore = nio_pas_hyp_assign(pas, cmd.start, resource_size(&cmd),
+-						&cmd_owners, &cmd_hlos, 1);
+-		dev_info(pas->dev, "nio image-start-test: CMD-DB HLOS RO restore=%d owners=%#llx\n", cmd_restore, cmd_owners);
+-		if (cmd_restore) { pas->nio_image_retained = true; ret = cmd_restore; }
+-	}
+-	if (cmd_bridge) {
+-		cmd_restore = qcom_scm_shm_bridge_delete(cmd_handle);
+-		dev_info(pas->dev, "nio image-start-test: CMD-DB bridge delete=%d\n", cmd_restore);
+-		if (cmd_restore) { pas->nio_image_retained = true; ret = cmd_restore; }
+-	}
+-	if (pas->nio_image_retained)
+-		dev_err(pas->dev, "nio image-start-test: kept shared; reboot required\n");
+-	/* Even a ready success is stopped; no persistent DSP ownership policy. */
+-	return ret ? ret : -EAGAIN;
+-}
+-
+ static int qcom_pas_start(struct rproc *rproc)
+ {
+ 	struct qcom_pas *pas = rproc->priv;
+@@ -506,12 +439,6 @@ static int qcom_pas_start(struct rproc *rproc)
+ 
+ 	qcom_pil_info_store(pas->info_name, pas->mem_phys, pas->mem_size);
+ 
+-	if (nio_el2_image_start_test && pas->pas_id == 1) {
+-		nio_el2_image_start_test = false; /* One attempt per explicit opt-in. */
+-		ret = nio_pas_image_start_test(pas);
+-		goto release_pas_metadata;
+-	}
+-
+ 	ret = qcom_scm_pas_auth_and_reset(pas->pas_id);
+ 	if (ret) {
+ 		dev_err(pas->dev,
+@@ -519,6 +446,16 @@ static int qcom_pas_start(struct rproc *rproc)
+ 		goto release_pas_metadata;
+ 	}
+ 
++	if (is_kernel_in_hyp_mode() && pas->pas_id == 1 && nio_lpass_bringup &&
++	    nio_lpass_prerequisites(pas->dev)) {
++		/* the image is loaded at mem_phys; mem_reloc is its link address (not relocated) */
++		ret = nio_lpass_bring_up(pas->dev, pas->mem_phys);
++		if (ret) {
++			qcom_scm_pas_shutdown(pas->pas_id);
++			goto release_pas_metadata;
++		}
++	}
++
+ 	ret = qcom_q6v5_wait_for_start(&pas->q6v5, msecs_to_jiffies(5000));
+ 	if (ret == -ETIMEDOUT) {
+ 		dev_err(pas->dev, "start timed out\n");
+diff --git a/include/linux/firmware/qcom/qcom_scm.h b/include/linux/firmware/qcom/qcom_scm.h
+index 72bb304..3c8e3a3 100644
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -12,6 +12,7 @@
+ #include <dt-bindings/firmware/qcom,scm.h>
+ 
+ int qcom_scm_nio_cmdb_test_take_bridge(u64 *handle);
++int qcom_scm_nio_cmdb_test_take_owners(u64 *owners);
+ 
+ #define QCOM_SCM_VERSION(major, minor)	(((major) << 16) | ((minor) & 0xFF))
+ #define QCOM_SCM_CPU_PWR_DOWN_L2_ON	0x0

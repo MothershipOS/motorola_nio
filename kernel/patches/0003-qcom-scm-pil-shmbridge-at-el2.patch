@@ -1,0 +1,173 @@
+diff -ruN a/drivers/firmware/qcom/qcom_scm.c b/drivers/firmware/qcom/qcom_scm.c
+--- a/drivers/firmware/qcom/qcom_scm.c	2026-10-08 13:16:22.185721503 +0200
++++ b/drivers/firmware/qcom/qcom_scm.c	2026-10-08 13:18:29.077736698 +0200
+@@ -35,6 +35,46 @@
+ #include "qcom_scm.h"
+ #include "qcom_tzmem.h"
+ 
++#include <asm/virt.h>
++
++/*
++ * mothershipOS: with Linux running at EL2 there is no Qualcomm hypervisor (QHEE) to create SHM
++ * bridges for PIL metadata on our behalf, so allocate it from the SHM-bridge-backed tzmem pool.
++ */
++static bool qcom_scm_pil_own_shmbridge(void)
++{
++	return is_kernel_in_hyp_mode();
++}
++
++/* SHM bridges we created for PAS image regions (one per pas_id), see qcom_scm_pas_el2_bridge() */
++#define QCOM_SCM_PAS_MAX_ID 64
++static u64 qcom_scm_pas_bridge[QCOM_SCM_PAS_MAX_ID];
++
++/**
++ * qcom_scm_pas_el2_bridge() - share a PAS image region with TZ when Linux runs at EL2
++ * @pas_id: peripheral authentication service id
++ * @addr: physical start of the loaded image
++ * @size: size of the loaded image
++ *
++ * Without QHEE nobody else creates the SHM bridge TZ needs to read the image during
++ * auth_and_reset. No-op when not at EL2. Returns 0 or a negative errno.
++ */
++int qcom_scm_pas_el2_bridge(u32 pas_id, phys_addr_t addr, size_t size)
++{
++	int ret;
++
++	if (!qcom_scm_pil_own_shmbridge() || pas_id >= QCOM_SCM_PAS_MAX_ID)
++		return 0;
++	if (qcom_scm_pas_bridge[pas_id]) {
++		qcom_tzmem_shm_bridge_delete(qcom_scm_pas_bridge[pas_id]);
++		qcom_scm_pas_bridge[pas_id] = 0;
++	}
++	ret = qcom_tzmem_shm_bridge_create(addr, PAGE_ALIGN(size), &qcom_scm_pas_bridge[pas_id]);
++	pr_info("qcom_scm: pas %u: SHM bridge %pa+%#zx -> %d\n", pas_id, &addr, size, ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_scm_pas_el2_bridge);
++
+ static u32 download_mode;
+ 
+ #define GIC_SPI_BASE        32
+@@ -632,7 +672,7 @@
+ 		.args[0] = pas_id,
+ 		.owner = ARM_SMCCC_OWNER_SIP,
+ 	};
+-	struct qcom_scm_res res;
++	struct qcom_scm_res res = {};
+ 
+ 	/*
+ 	 * During the scm call memory protection will be enabled for the meta
+@@ -646,10 +686,17 @@
+ 	 * If we pass a buffer that is already part of an SHM Bridge to this
+ 	 * call, it will fail.
+ 	 */
+-	mdata_buf = dma_alloc_coherent(__scm->dev, size, &mdata_phys,
+-				       GFP_KERNEL);
+-	if (!mdata_buf)
+-		return -ENOMEM;
++	if (qcom_scm_pil_own_shmbridge()) {
++		mdata_buf = qcom_tzmem_alloc(__scm->mempool, size, GFP_KERNEL);
++		if (!mdata_buf)
++			return -ENOMEM;
++		mdata_phys = qcom_tzmem_to_phys(mdata_buf);
++	} else {
++		mdata_buf = dma_alloc_coherent(__scm->dev, size, &mdata_phys,
++					       GFP_KERNEL);
++		if (!mdata_buf)
++			return -ENOMEM;
++	}
+ 
+ 	memcpy(mdata_buf, metadata, size);
+ 
+@@ -670,8 +717,14 @@
+ 	qcom_scm_clk_disable();
+ 
+ out:
++	if (ret || res.result[0])
++		dev_err(__scm->dev, "pas_init_image(%u) ret=%d tz_result=%#llx mdata=%pa own_shmbridge=%d\n",
++			pas_id, ret, (u64)res.result[0], &mdata_phys, qcom_scm_pil_own_shmbridge());
+ 	if (ret < 0 || !ctx) {
+-		dma_free_coherent(__scm->dev, size, mdata_buf, mdata_phys);
++		if (qcom_scm_pil_own_shmbridge())
++			qcom_tzmem_free(mdata_buf);
++		else
++			dma_free_coherent(__scm->dev, size, mdata_buf, mdata_phys);
+ 	} else if (ctx) {
+ 		ctx->ptr = mdata_buf;
+ 		ctx->phys = mdata_phys;
+@@ -691,7 +744,10 @@
+ 	if (!ctx->ptr)
+ 		return;
+ 
+-	dma_free_coherent(__scm->dev, ctx->size, ctx->ptr, ctx->phys);
++	if (qcom_scm_pil_own_shmbridge())
++		qcom_tzmem_free(ctx->ptr);
++	else
++		dma_free_coherent(__scm->dev, ctx->size, ctx->ptr, ctx->phys);
+ 
+ 	ctx->ptr = NULL;
+ 	ctx->phys = 0;
+@@ -757,7 +813,7 @@
+ 		.args[0] = pas_id,
+ 		.owner = ARM_SMCCC_OWNER_SIP,
+ 	};
+-	struct qcom_scm_res res;
++	struct qcom_scm_res res = {};
+ 
+ 	ret = qcom_scm_clk_enable();
+ 	if (ret)
+@@ -773,6 +829,8 @@
+ disable_clk:
+ 	qcom_scm_clk_disable();
+ 
++	if (ret || res.result[0])
++		dev_err(__scm->dev, "pas_auth_and_reset(%u) ret=%d tz_result=%#llx\n", pas_id, ret, (u64)res.result[0]);
+ 	return ret ? : res.result[0];
+ }
+ EXPORT_SYMBOL_GPL(qcom_scm_pas_auth_and_reset);
+@@ -804,6 +862,10 @@
+ 		goto disable_clk;
+ 
+ 	ret = qcom_scm_call(__scm->dev, &desc, &res);
++	if (pas_id < QCOM_SCM_PAS_MAX_ID && qcom_scm_pas_bridge[pas_id]) {
++		qcom_tzmem_shm_bridge_delete(qcom_scm_pas_bridge[pas_id]);
++		qcom_scm_pas_bridge[pas_id] = 0;
++	}
+ 	qcom_scm_bw_disable();
+ 
+ disable_clk:
+diff -ruN a/drivers/firmware/qcom/qcom_tzmem.c b/drivers/firmware/qcom/qcom_tzmem.c
+--- a/drivers/firmware/qcom/qcom_tzmem.c	2026-10-08 13:16:22.209264227 +0200
++++ b/drivers/firmware/qcom/qcom_tzmem.c	2026-10-08 13:18:08.267420318 +0200
+@@ -103,6 +103,7 @@
+ 
+ 	if (!ret)
+ 		qcom_tzmem_using_shm_bridge = true;
++	dev_info(qcom_tzmem_dev, "SHM Bridge enable: %d\n", ret);
+ 
+ 	return ret;
+ 
+diff -ruN a/drivers/soc/qcom/mdt_loader.c b/drivers/soc/qcom/mdt_loader.c
+--- a/drivers/soc/qcom/mdt_loader.c	2026-10-08 13:18:08.263743370 +0200
++++ b/drivers/soc/qcom/mdt_loader.c	2026-10-08 13:18:08.272550012 +0200
+@@ -284,6 +284,9 @@
+ 
+ 	ret = qcom_scm_pas_init_image(pas_id, metadata, metadata_len, ctx);
+ 	kfree(metadata);
++	if (!ret)
++		ret = qcom_scm_pas_el2_bridge(pas_id, relocate ? mem_phys : min_addr,
++					      max_addr - min_addr);
+ 	if (ret) {
+ 		/* Invalid firmware metadata */
+ 		dev_err(dev, "error %d initializing firmware %s\n", ret, fw_name);
+diff -ruN a/include/linux/firmware/qcom/qcom_scm.h b/include/linux/firmware/qcom/qcom_scm.h
+--- a/include/linux/firmware/qcom/qcom_scm.h	2026-10-08 13:18:08.264885607 +0200
++++ b/include/linux/firmware/qcom/qcom_scm.h	2026-10-08 13:18:08.274916129 +0200
+@@ -91,6 +91,7 @@
+ void qcom_scm_pas_metadata_release(struct qcom_scm_pas_metadata *ctx);
+ int qcom_scm_pas_mem_setup(u32 pas_id, phys_addr_t addr, phys_addr_t size);
+ int qcom_scm_pas_auth_and_reset(u32 pas_id);
++int qcom_scm_pas_el2_bridge(u32 pas_id, phys_addr_t addr, size_t size);
+ int qcom_scm_pas_shutdown(u32 pas_id);
+ bool qcom_scm_pas_supported(u32 pas_id);
+ 

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0
+/* mothershipOS: Venus video codec at EL2 (runtime test overlay; apply with nio_of_overlay firmware=nio-venus.dtbo).
+ * TZ authenticates the stock firmware (modem_a image/venus.mdt + .bNN), the venus driver then starts the core the
+ * way the stock hypervisor did (patch 0020, "mothership,el2-video-start"). */
+/dts-v1/;
+/plugin/;
+
+&{/soc@0/video-codec@aa00000} {
+	firmware-name = "qcom/sm8250/nio/venus.mdt";
+	mothership,el2-video-start;
+	status = "okay";
+};
